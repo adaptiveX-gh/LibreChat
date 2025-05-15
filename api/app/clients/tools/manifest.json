@@ -243,9 +243,9 @@
     "icon": "https://www.svgrepo.com/show/5436/graph.svg",
     "authConfig": [
       {
-        "authField": "HYPERLIQUID_API_URL",
-        "label": "Hyperliquid API URL",
-        "description": "Your API URL for Hyperliquid service."
+        "authField": "HYPERLIQUID_API_KEY",
+        "label": "Hyperliquid API KEY",
+        "description": "Your API KEY for Hyperliquid service."
       }
     ]
   }    
