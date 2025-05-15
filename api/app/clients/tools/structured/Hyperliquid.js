@@ -109,7 +109,7 @@ async function fetchBrowseRows() {
 async function fetchSheetRows() {
   if (!GS_ID) throw new Error("GOOGLE_SHEET_ID env var missing");
 
-  const url = `https://docs.google.com/spreadsheets/d/${GS_ID}/export?format=csv&gid=${GS_GID}`;
+  const url = `https://docs.google.com/spreadsheets/d/${GS_ID}/gviz/tq?tqx=out:csv&gid=${GS_GID}`;
   const { data: csv } = await axios.get(url);
 
   const lines   = csv.trim().split(/\r?\n/);
