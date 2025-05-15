@@ -10,7 +10,6 @@ const {
   GoogleSearchAPI,
   // Structured Tools
   DALLE3,
-  FluxAPI,
   OpenWeather,
   StructuredSD,
   StructuredACS,
@@ -150,7 +149,6 @@ const loadTools = async ({
   returnMap = false,
 }) => {
   const toolConstructors = {
-    flux: FluxAPI,
     calculator: Calculator,
     google: GoogleSearchAPI,
     open_weather: OpenWeather,
@@ -288,7 +286,6 @@ const loadTools = async ({
   };
 
   const toolOptions = {
-    flux: imageGenOptions,
     dalle: imageGenOptions,
     'stable-diffusion': imageGenOptions,
     serpapi: { location: 'Austin,Texas,United States', hl: 'en', gl: 'us' },
