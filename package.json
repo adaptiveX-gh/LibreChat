@@ -141,8 +141,5 @@
       "admin/",
       "packages/"
     ]
-  },
-  "dependencies": {
-    "papaparse": "^5.5.2"
   }
 }
