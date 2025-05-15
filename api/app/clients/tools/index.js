@@ -2,7 +2,6 @@ const availableTools = require('./manifest.json');
 
 // Structured Tools
 const DALLE3 = require('./structured/DALLE3');
-const FluxAPI = require('./structured/FluxAPI');
 const OpenWeather = require('./structured/OpenWeather');
 const StructuredWolfram = require('./structured/Wolfram');
 const createYouTubeTools = require('./structured/YouTube');
@@ -37,7 +36,6 @@ module.exports = {
   manifestToolMap,
   // Structured Tools
   DALLE3,
-  FluxAPI,
   OpenWeather,
   StructuredSD,
   StructuredACS,
