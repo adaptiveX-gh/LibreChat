@@ -12,6 +12,11 @@ const GoogleSearchAPI = require('./structured/GoogleSearch');
 const TraversaalSearch = require('./structured/TraversaalSearch');
 const createOpenAIImageTools = require('./structured/OpenAIImageTools');
 const TavilySearchResults = require('./structured/TavilySearchResults');
+const CoinGeckoAPI = require("./structured/CoinGecko");
+const ChartImgAPI = require("./structured/ChartImg");
+const FinnhubAPI = require("./structured/Finnhub");
+const SentimentXAPI = require("./structured/SentimentXAPI"); 
+const HyperliquidAPI = require("./structured/Hyperliquid");
 
 /** @type {Record<string, TPlugin | undefined>} */
 const manifestToolMap = {};
@@ -41,5 +46,10 @@ module.exports = {
   StructuredWolfram,
   createYouTubeTools,
   TavilySearchResults,
+  CoinGeckoAPI,
+  ChartImgAPI,
+  FinnhubAPI,
+  SentimentXAPI,
+  HyperliquidAPI,
   createOpenAIImageTools,
 };

@@ -192,5 +192,75 @@
         "description": "Provide your Flux API key from your user profile."
       }
     ]
-  }
+  },
+  {
+    "name": "CoinGecko",
+    "pluginKey": "coingecko",
+    "description": "Retrieve cryptocurrency prices from CoinGecko via Goat SDK.",
+    "icon": "https://www.coingecko.com/favicon.ico",
+    "authConfig": [
+      {
+        "authField": "COINGECKO_API_KEY",
+        "label": "CoinGecko API Key",
+        "description": "Your API key for CoinGecko via Goat SDK."
+      }
+    ]
+  },
+  {
+    "name": "ChartIMG",
+    "pluginKey": "chartimg",
+    "description": "Retrieve mini trading charts from Binance using Chart-IMG API.",
+    "icon": "https://www.svgrepo.com/show/5436/graph.svg",
+    "authConfig": [
+      {
+        "authField": "CHART_IMG_API_KEY",
+        "label": "Chart-IMG API Key",
+        "description": "Your API key for Chart-IMG service."
+      }
+    ]
+  },
+  {
+    "name": "Finnhub",
+    "pluginKey": "finnhub",
+    "description": "Retrieve crypto data from Binance using Finnhub API.",
+    "icon": "https://www.svgrepo.com/show/5436/graph.svg",
+    "authConfig": [
+      {
+        "authField": "FINNHUB_API_KEY",
+        "label": "Finnhub API Key",
+        "description": "Your API key for Finnhub service."
+      }
+    ]
+  },  
+  {
+    "name": "SentimentX",
+    "pluginKey": "sentimentx",
+    "description": "Fetch categorized Twitter insights (sentiment, whales, news, top traders) using SentimentX API.",
+    "icon": "https://api.iconify.design/mdi:twitter.svg",
+    "authConfig": [
+      {
+        "authField": "SENTIMENTX_API_KEY",
+        "label": "SentimentX API Key",
+        "description": "Your API key for SentimentX REST API."
+      },
+      {
+        "authField": "SENTIMENTX_API_URL",
+        "label": "SentimentX API URL",
+        "description": "Your API endpoint for SentimentX."
+      }
+    ]
+  },
+  {
+    "name": "Hyperliquid",
+    "pluginKey": "hyperliquid",
+    "description": "Retrieve and send data from Hyperliquid using API.",
+    "icon": "https://www.svgrepo.com/show/5436/graph.svg",
+    "authConfig": [
+      {
+        "authField": "HYPERLIQUID_API_KEY",
+        "label": "Hyperliquid API Key",
+        "description": "Your API key for Hyperliquid service."
+      }
+    ]
+  }    
 ]

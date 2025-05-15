@@ -18,6 +18,11 @@ const {
   StructuredWolfram,
   createYouTubeTools,
   TavilySearchResults,
+  CoinGeckoAPI,
+  ChartImgAPI,
+  FinnhubAPI,
+  SentimentXAPI,
+  HyperliquidAPI,
   createOpenAIImageTools,
 } = require('../');
 const { primeFiles: primeCodeFiles } = require('~/server/services/Files/Code/process');
@@ -154,6 +159,11 @@ const loadTools = async ({
     'azure-ai-search': StructuredACS,
     traversaal_search: TraversaalSearch,
     tavily_search_results_json: TavilySearchResults,
+    coingecko: CoinGeckoAPI, 
+    finnhub: FinnhubAPI,
+    chartimg: ChartImgAPI,
+    sentimentx: SentimentXAPI, 
+    hyperliquid: HyperliquidAPI,    
   };
 
   const customConstructors = {
@@ -175,6 +185,61 @@ const loadTools = async ({
       const authValues = await loadAuthValues({ userId: user, authFields });
       return createYouTubeTools(authValues);
     },
+    coingecko: async () => {
+      const authFields = getAuthFields('coingecko');
+      let apiKey = process.env[authFields[0]];
+  
+      if (!apiKey) {
+        apiKey = await getUserPluginAuthValue(user, authFields[0]);
+      }
+  
+      const CoinGeckoAPI = require('../structured/CoinGecko');
+      return new CoinGeckoAPI({ COINGECKO_API_KEY: apiKey });
+    },    
+    chartimg: async () => { // ✅ Add Chart-IMG here
+        const authFields = getAuthFields('chartimg');
+        let apiKey = process.env[authFields[0]];
+
+        if (!apiKey) {
+            apiKey = await getUserPluginAuthValue(user, authFields[0]);
+        }
+
+        const ChartImgAPI = require('../structured/ChartImg');
+        return new ChartImgAPI({ CHART_IMG_API_KEY: apiKey });
+    },
+    finnhub: async () => { 
+      const authFields = getAuthFields('finnhub');
+      let apiKey = process.env[authFields[0]];
+
+      if (!apiKey) {
+          apiKey = await getUserPluginAuthValue(user, authFields[0]);
+      }
+
+      const FinnhubAPI = require('../structured/Finnhub');
+      return new FinnhubAPI({ FINNHUB_API_KEY: apiKey });
+  },    
+    sentimentx: async () => {  // ✅ Add SentimentX Authentication
+      const authFields = getAuthFields("sentimentx");
+      let apiKey = process.env[authFields[0]];
+  
+      if (!apiKey) {
+        apiKey = await getUserPluginAuthValue(user, authFields[0]);
+      }
+  
+      const SentimentXAPI = require("../structured/SentimentXAPI");
+      return new SentimentXAPI({ SENTIMENTX_API_KEY: apiKey });
+    }, 
+    hyperliquid: async () => {  // ✅ Add SentimentX Authentication
+      const authFields = getAuthFields("hyperliquid");
+      let apiKey = process.env[authFields[0]];
+  
+      if (!apiKey) {
+        apiKey = await getUserPluginAuthValue(user, authFields[0]);
+      }
+  
+      const HyperliquidAPI = require("../structured/Hyperliquid");
+      return new HyperliquidAPI({ HYPERLIQUID_API_KEY: apiKey });
+    }, 
     image_gen_oai: async (toolContextMap) => {
       const authFields = getAuthFields('image_gen_oai');
       const authValues = await loadAuthValues({ userId: user, authFields });
