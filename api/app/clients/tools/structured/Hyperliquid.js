@@ -1,26 +1,20 @@
 /**
- * hyperliquid.js  –  LangChain Tool
+ * hyperliquid.js  —  LangChain Tool
  *
- * NEW FEATURES
- *   • If { useBrowse: true } is passed (or no addresses supplied),
- *     the tool calls Browse AI → pulls the latest “Trader Details” table
- *     → extracts wallet addresses → applies optional filters.
- *   • Optional filters: minWinrate %, minDuration h.
- *   • Keeps all previous functionality (profit-takes, flips, drip scalping,
- *     open-position detection, JSON output).
+ * Sources trader wallets from:
+ *   • explicit "addresses": [...]                         (direct mode)
+ *   • Browse AI robot table  →  useBrowse: true           (browse-mode)
+ *   • Google Sheet CSV       →  useSheet:  true           (sheet-mode)
  *
- * USAGE EXAMPLES
- *   // 1️⃣  Provide your own addresses (same as before)
- *   hlTool.call({ addresses: [...], hours: 24, positions: true });
+ * Optional filters (browse / sheet):
+ *   • minWinrate   – percent (default 0)
+ *   • minDuration  – hours   (default 0)
  *
- *   // 2️⃣  Auto-pull from Browse AI and analyse
- *   hlTool.call({
- *     useBrowse: true,
- *     minWinrate: 70,
- *     minDuration: 15,
- *     hours: 24,
- *     positions: true
- *   });
+ * Other options:
+ *   • hours        – look-back window for fills   (1-168, default 1)
+ *   • positions    – boolean. include live open positions
+ *
+ * Returns JSON [{ address, fills, insights, openPositions? }]
  */
 
 const axios    = require("axios");
@@ -28,7 +22,7 @@ const { Tool } = require("@langchain/core/tools");
 const { z }    = require("zod");
 
 // ─────────────────────────────────────────────────────────────
-// 0.  ENV & Constants
+// 0.  ENV & constants
 // ─────────────────────────────────────────────────────────────
 const API_HL   = process.env.HYPERLIQUID_API_URL || "https://api.hyperliquid.xyz";
 const API_BAI  = "https://api.browse.ai/v2";
@@ -43,13 +37,17 @@ const BAI_KEY   = process.env.BROWSEAI_API_KEY;
 const BAI_TEAM  = process.env.BROWSEAI_TEAM_ID;
 const BAI_ROBOT = process.env.BROWSEAI_ROBOT_ID;
 
+// Google Sheet creds
+const GS_ID     = process.env.GOOGLE_SHEET_ID;
+const GS_GID    = process.env.GOOGLE_SHEET_GID || 0;
+
 // thresholds for Hyperliquid insight detection
-const BIG_NOTIONAL = 50_000; // usd
+const BIG_NOTIONAL = 50_000; // USD
 const DRIP_COUNT   = 15;
-const DRIP_SIZE    = 500;    // usd
+const DRIP_SIZE    = 500;
 
 // ─────────────────────────────────────────────────────────────
-// 1.  Tiny concurrency limiter  (≈ p-limit in 12 lines)
+// 1.  Tiny concurrency limiter (≈ p-limit in 12 lines)
 // ─────────────────────────────────────────────────────────────
 function limiter(max = 4) {
   let active = 0;
@@ -58,13 +56,10 @@ function limiter(max = 4) {
     if (active >= max || !q.length) return;
     const { fn, res, rej } = q.shift();
     active++;
-    fn()
-      .then(res)
-      .catch(rej)
-      .finally(() => {
-        active--;
-        next();
-      });
+    fn().then(res).catch(rej).finally(() => {
+      active--;
+      next();
+    });
   }
   return fn => new Promise((res, rej) => {
     q.push({ fn, res, rej });
@@ -74,61 +69,74 @@ function limiter(max = 4) {
 const limit = limiter(4);
 
 // ─────────────────────────────────────────────────────────────
-// 2.  Browse AI helpers
+// 2A.  Browse AI helper  (unchanged)
 // ─────────────────────────────────────────────────────────────
-async function fetchBrowseTable() {
+async function fetchBrowseRows() {
   if (!BAI_KEY || !BAI_TEAM || !BAI_ROBOT) {
     throw new Error("Browse AI creds missing in env");
   }
 
-  // 1️⃣  Get the most-recent successful task for this robot
-  const tsRes = await axios.get(
+  // most-recent successful task
+  const taskList = await axios.get(
     `${API_BAI}/robots/${BAI_ROBOT}/tasks`,
     {
-      params: {
-        teamId: BAI_TEAM,
-        status: "successful",
-        limit: 1,
-        page: 1
-      },
+      params: { teamId: BAI_TEAM, status: "successful", limit: 1, page: 1 },
       headers: { Authorization: `Bearer ${BAI_KEY}` }
     }
   );
-  if (!tsRes.data.tasks?.length) return [];
+  if (!taskList.data.tasks?.length) return [];
 
-  const taskId = tsRes.data.tasks[0].id;
-
-  // 2️⃣  Pull that task’s output (tables)
-  const task = await axios.get(
+  const taskId = taskList.data.tasks[0].id;
+  const task   = await axios.get(
     `${API_BAI}/tasks/${taskId}`,
     { headers: { Authorization: `Bearer ${BAI_KEY}` } }
   );
 
-  const rows =
-    task.data.result?.tables?.[0]?.rows || []; // robot has one table → rows[]
-
-  /* Row sample (based on your screenshot):
-     {
-       "Origin URL": "https://hyperdash.info/traders/0x863b…",
-       "Total PnL":  "$472,797.61",
-       "Winrate":    "Winrate: 80%",
-       "Duration":   "136h 22m"
-     }
-  */
+  const rows = task.data.result?.tables?.[0]?.rows || [];
   return rows.map(r => ({
-    addr: (r["Origin URL"] || "").match(ETH_RE)?.[0] || null,
+    addr:   (r["Origin URL"] || "").match(ETH_RE)?.[0] || null,
     winrate: Number((r["Winrate"] || "").match(/([\d.]+)/)?.[1] || 0),
-    duration:
-      (() => {
-        const [h, m] = (r["Duration"] || "").split(/[hm]/).filter(Boolean);
-        return (+h || 0) + ((+m || 0) / 60);
-      })(),
-    row: r
+    duration: (() => {
+      const [h, m] = (r["Duration"] || "").split(/[hm]/).filter(Boolean);
+      return (+h || 0) + (+m || 0) / 60;
+    })()
   })).filter(r => r.addr);
 }
 
 // ─────────────────────────────────────────────────────────────
-// 3.  Hyperliquid insight helpers  (unchanged)
+// 2B.  Google Sheet helper (no external deps)
+// ─────────────────────────────────────────────────────────────
+async function fetchSheetRows() {
+  if (!GS_ID) throw new Error("GOOGLE_SHEET_ID env var missing");
+
+  const url = `https://docs.google.com/spreadsheets/d/${GS_ID}/export?format=csv&gid=${GS_GID}`;
+  const { data: csv } = await axios.get(url);
+
+  const lines   = csv.trim().split(/\r?\n/);
+  const headers = lines[0].split(",").map(h => h.trim().toLowerCase());
+
+  return lines.slice(1).map(line => {
+    const cols = line.split(",").map(c => c.trim());
+    const obj  = Object.fromEntries(headers.map((h, i) => [h, cols[i] || ""]));
+
+    // expected cols: wallet | winrate | duration
+    const addr = obj.wallet?.toLowerCase() || "";
+    if (!ETH_RE.test(addr)) return null;
+
+    const win  = Number((obj.winrate || "").replace("%", ""));
+    const dur  = (() => {
+      const hr = (obj.duration.match(/(\d+)\s*h/i) || [])[1];
+      const mn = (obj.duration.match(/(\d+)\s*m/i) || [])[1];
+      if (hr || mn) return (+hr || 0) + (+mn || 0) / 60;
+      return Number(obj.duration) || 0;
+    })();
+
+    return { addr, winrate: win, duration: dur };
+  }).filter(Boolean);
+}
+
+// ─────────────────────────────────────────────────────────────
+// 3.  Hyperliquid insight helpers
 // ─────────────────────────────────────────────────────────────
 function analyseFills(fills = []) {
   const out = { profitTakes: [], flips: [], newBuilds: [], dripStyle: false };
@@ -141,7 +149,7 @@ function analyseFills(fills = []) {
     const notional = Math.abs(+f.sz) * +f.px;
     const sideWord = f.dir.includes("Long") ? "long" : "short";
 
-    // 1. profit-takes
+    // profit-takes
     if (f.dir.startsWith("Close") && notional >= BIG_NOTIONAL) {
       out.profitTakes.push({
         coin, dir: f.dir, size: big$(f.sz), px: big$(f.px),
@@ -149,7 +157,7 @@ function analyseFills(fills = []) {
       });
     }
 
-    // 2. flips
+    // flips
     if (f.dir.startsWith("Close")) {
       lastSide[coin] = sideWord;
     } else if (f.dir.startsWith("Open")) {
@@ -162,7 +170,7 @@ function analyseFills(fills = []) {
       lastSide[coin] = sideWord;
     }
 
-    // 3. new builds
+    // new builds
     if (f.dir.startsWith("Open") && notional >= BIG_NOTIONAL) {
       out.newBuilds.push({
         coin, dir: f.dir, size: big$(f.sz), px: big$(f.px), ts: f.time
@@ -170,7 +178,7 @@ function analyseFills(fills = []) {
     }
   }
 
-  // 4. drip scalping
+  // drip scalping
   const tinyCloses = fills.filter(
     f => f.dir.startsWith("Close") && Math.abs(+f.sz) * +f.px <= DRIP_SIZE
   );
@@ -179,10 +187,10 @@ function analyseFills(fills = []) {
   return out;
 }
 
-async function fetchOpenPositions(restBase, addr) {
+async function fetchOpenPositions(base, addr) {
   try {
     const { data } = await axios.post(
-      `${restBase}/info`,
+      `${base}/info`,
       { type: "clearinghouseState", user: addr },
       { headers: { "Content-Type": "application/json" } }
     );
@@ -212,30 +220,27 @@ class HyperliquidAPI extends Tool {
   description = `
 Analyse Hyperliquid whale activity.
 
-Input options:
-• provide "addresses": [...] (array of 0x wallets)   – OR –
-• set  "useBrowse": true  to auto-download the latest Trader table
-  from your Browse AI robot.
+Source modes (choose one):
+• "addresses": [...]           – explicit wallet list
+• "useBrowse": true            – pull from Browse AI robot table
+• "useSheet":  true            – pull from Google Sheet CSV
 
-Optional filters when useBrowse=true:
-• minWinrate  – percent  (default 0)
-• minDuration – hours    (default 0)
+Optional filters (browse / sheet):
+• minWinrate   – %  (default 0)
+• minDuration  – h  (default 0)
 
-Other options (both modes):
-• hours       – look-back window for fills   (1 - 168, default 1)
-• positions   – boolean. if true, include live open positions
+Other options:
+• hours      – look-back window (default 1)
+• positions  – include open positions
 
-Returns JSON array [{ address, fills, insights, openPositions?, meta? }].`;
+Returns JSON [{ address, fills, insights, openPositions? }].`;
 
   schema = z.object({
-    addresses:   z.array(z.string()).optional()
-      .describe("Direct list of Ethereum addresses"),
-    useBrowse:   z.boolean().optional().default(false)
-      .describe("If true, pull list from Browse AI robot"),
-    minWinrate:  z.number().optional().default(0)
-      .describe("Filter (Browse AI): keep traders with win-rate ≥ this"),
-    minDuration: z.number().optional().default(0)
-      .describe("Filter (Browse AI): keep traders with avg duration ≥ this"),
+    addresses:   z.array(z.string()).optional(),
+    useBrowse:   z.boolean().optional().default(false),
+    useSheet:    z.boolean().optional().default(false),
+    minWinrate:  z.number().optional().default(0),
+    minDuration: z.number().optional().default(0),
     hours:       z.number().int().min(1).max(168).default(1).optional(),
     positions:   z.boolean().optional().default(false)
   });
@@ -248,6 +253,7 @@ Returns JSON array [{ address, fills, insights, openPositions?, meta? }].`;
   /** @param {{
    *   addresses?: string[],
    *   useBrowse?: boolean,
+   *   useSheet?:  boolean,
    *   minWinrate?: number,
    *   minDuration?: number,
    *   hours?: number,
@@ -257,27 +263,31 @@ Returns JSON array [{ address, fills, insights, openPositions?, meta? }].`;
     const {
       addresses = [],
       useBrowse = false,
+      useSheet  = false,
       minWinrate = 0,
       minDuration = 0,
       hours = 1,
       positions = false
     } = args;
 
-    // 0️⃣  If Browse AI mode requested → pull & filter
+    // ---------------- wallet sourcing ----------------
     let addrList = addresses;
-    if (useBrowse || !addrList.length) {
-      const rows = await fetchBrowseTable();
+
+    if (useBrowse || useSheet || !addrList.length) {
+      let rows = [];
+
+      if (useBrowse) {
+        rows = await fetchBrowseRows();
+      } else if (useSheet) {
+        rows = await fetchSheetRows();
+      }
 
       addrList = rows
         .filter(r => r.winrate >= minWinrate && r.duration >= minDuration)
         .map(r => r.addr);
 
       if (!addrList.length) {
-        return JSON.stringify(
-          { error: "No traders passed the filter from Browse AI table." },
-          null,
-          2
-        );
+        return JSON.stringify({ error: "No traders passed the filter." }, null, 2);
       }
     }
 
@@ -288,8 +298,8 @@ Returns JSON array [{ address, fills, insights, openPositions?, meta? }].`;
     const now       = Date.now();
     const startTime = now - hours * MS_HOUR;
 
-    // 1️⃣  fetch fills concurrently
-    const fillResults = await Promise.all(
+    // ---------------- pull fills ----------------
+    const fills = await Promise.all(
       addrList.map(addr =>
         limit(async () => {
           try {
@@ -313,21 +323,21 @@ Returns JSON array [{ address, fills, insights, openPositions?, meta? }].`;
       )
     );
 
-    // 2️⃣  analyse + open-positions
+    // ---------------- analyse & open positions ----------------
     const summary = await Promise.all(
-      fillResults.map(async r => {
+      fills.map(async r => {
         if (r.error) return { address: r.address, error: r.error };
 
-        const obj = {
+        const o = {
           address:  r.address,
           fills:    r.fills,
           insights: analyseFills(r.fills)
         };
 
         if (positions) {
-          obj.openPositions = await fetchOpenPositions(this.restBase, r.address);
+          o.openPositions = await fetchOpenPositions(this.restBase, r.address);
         }
-        return obj;
+        return o;
       })
     );
 
