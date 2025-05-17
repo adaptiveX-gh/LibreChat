@@ -1023,9 +1023,15 @@ async function runPositionDeltaPulse({ addrList }, p = {}) {
         hlPost({ type: "clearinghouseState", user: addr })
       ]).catch(() => []);
 
-    const pos = (ch.assetPositions || [])
-                  .find(p => +p.position.szi !== 0);
-    if (!pos) continue;                       // the trader is flat now
+      const active = (ch.assetPositions || []).filter(
+        p => +p.position.szi !== 0
+      );
+      if (!active.length) continue;
+
+      for (const pos of active) {
+        // --- existing analysis block goes here ---
+        // if you return an event, `return { … }` will break out of both loops
+      }
 
     const sideNow   = +pos.position.szi > 0 ? "long" : "short";
     const absSize   = Math.abs(+pos.position.szi) * +pos.position.entryPx;
@@ -1207,7 +1213,7 @@ ticker (tickerLookup), params{} (mode-specific knobs).`;
 
       // Each strategy gets addrList but **internally** they chunk
       // if they call /info userFillsByTime
-      const out = await runner({ addrList }, { ...params, ticker, lookbackMs });
+      const out = await runner({ addrList }, { ...params, ticker, windowMs: lookbackMs });
       return JSON.stringify(out, null, 2);
     }
 
