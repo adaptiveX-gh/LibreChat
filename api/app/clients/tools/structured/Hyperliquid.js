@@ -119,12 +119,17 @@ const getSpotMeta = cached(async () => {
 });
 
 async function fetchLiquidations(startMs, endMs) {
-   // Hyperliquid wants seconds (ints) and ≤120-sec span
-   const start = Math.floor(startMs / 1000);
-   const end   = Math.floor(endMs   / 1000);
-   const { data } = await hlPost({ type: "liquidations", startTime: start, endTime: end });
-   return data.events ?? [];
- }
+  const start = Math.floor(startMs / 1000);   // seconds, not ms
+  const end   = Math.floor(endMs   / 1000);
+  try {
+    const { data } = await hlPost({ type: "liquidations", startTime: start, endTime: end });
+    return data.events ?? [];
+  } catch (e) {
+    if (e.response?.status === 422) return [];   // treat as “no events”, not an error
+    throw e;
+  }
+}
+
 
 /**
  * Sum liquidations by coin & side in a time-window
