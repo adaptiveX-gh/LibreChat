@@ -991,26 +991,30 @@ async function runOpenInterestPulse({ addrList }, p = {}) {
 }
 
 /**
- * runPositionDeltaPulse – detect large position changes by a single wallet
+ * runPositionDeltaPulse – detect large position changes by the wallets list
+ *
  * params:
- *   windowMs   default 600_000  (10 min)
- *   trimUsd    default 250_000  (closed against current side)
- *   addUsd     default 250_000  (opened with current side)
- *   newUsd     default 250_000  (brand-new position size)
+ *   windowMs   (default 600 000 ms  = 10 min look-back)
+ *   trimUsd    (default 250 000)    – “reduced” threshold
+ *   addUsd     (default 250 000)    – “added”   threshold
+ *   newUsd     (default 250 000)    – “opened”  threshold
+ *   maxHits    (default Infinity)   – stop after N matches (set 0/Infinity for all)
  */
 async function runPositionDeltaPulse({ addrList }, p = {}) {
   const {
     windowMs = 600_000,
     trimUsd  = 250_000,
     addUsd   = 250_000,
-    newUsd   = 250_000
+    newUsd   = 250_000,
+    maxHits  = Infinity           // ← new knob
   } = p;
 
   const end   = Date.now();
   const start = end - windowMs;
+  const results = [];
 
   for (const addr of addrList) {
-    // ─── 1️⃣  pull fills and current positions ──────────────────────────
+    /* ── 1️⃣  fetch fills + current positions ───────────────────────── */
     let fills = [], positions = [];
     try {
       const [fillsResp, chResp] = await Promise.all([
@@ -1023,53 +1027,54 @@ async function runPositionDeltaPulse({ addrList }, p = {}) {
         }),
         hlPost({ type: "clearinghouseState", user: addr })
       ]);
-      fills      = fillsResp?.data || [];
-      positions  = (chResp?.data?.assetPositions || []);
-    } catch { /* network hiccup → just skip this wallet */ continue; }
+      fills     = fillsResp?.data || [];
+      positions = chResp?.data?.assetPositions || [];
+    } catch {
+      continue;   // skip wallet on network/API hiccup
+    }
 
-    // map of open positions *after* the look-back window
-    const openNow = {};          // coin → { side, sizeUsd, entry, liq }
-    for (const p of positions) {
-      const sz = +p.position.szi;
+    /* ── 2️⃣  snapshot of open positions *now* ──────────────────────── */
+    const openNow = {}; // coin → { side, sizeUsd, entry, liqPx }
+    for (const pos of positions) {
+      const sz = +pos.position.szi;
       if (sz === 0) continue;
-      openNow[p.position.coin] = {
-        side:     sz > 0 ? "long" : "short",
-        sizeUsd:  Math.abs(sz) * +p.position.entryPx,
-        entry:    +p.position.entryPx,
-        liqPx:    +p.position.liquidationPx
+      openNow[pos.position.coin] = {
+        side:    sz > 0 ? "long" : "short",
+        sizeUsd: Math.abs(sz) * +pos.position.entryPx,
+        entry:   +pos.position.entryPx,
+        liqPx:   +pos.position.liquidationPx
       };
     }
 
-    // 2️⃣  aggregate USD opened / closed per coin & side
+    /* ── 3️⃣  USD opened / closed per coin + side in the window ─────── */
     const opened = {}, closed = {};  // coin → { longUsd, shortUsd }
-    const bump   = (tbl, coin, sideField, usd) =>
-      tbl[coin] = { ...(tbl[coin]||{ longUsd:0, shortUsd:0 }), [sideField]: (tbl[coin]?.[sideField]||0)+usd };
+    const bump = (table, coin, field, usd) =>
+      (table[coin] = { ...(table[coin] || { longUsd:0, shortUsd:0 }),
+                       [field]: (table[coin]?.[field] || 0) + usd });
 
     for (const f of fills) {
-      const usd   = Math.abs(+f.sz) * +f.px;
-      const coin  = f.coin;
-      const isLong = f.dir.includes("Long");
-      const sideField = isLong ? "longUsd" : "shortUsd";
+      const usd  = Math.abs(+f.sz) * +f.px;
+      const coin = f.coin;
+      const fld  = f.dir.includes("Long") ? "longUsd" : "shortUsd";
 
-      if (f.dir.startsWith("Open"))  bump(opened, coin, sideField, usd);
-      if (f.dir.startsWith("Close")) bump(closed, coin, sideField, usd);
+      if (f.dir.startsWith("Open"))  bump(opened, coin, fld, usd);
+      if (f.dir.startsWith("Close")) bump(closed, coin, fld, usd);
     }
 
-    // 3️⃣  test each coin we touched
-    const coinsTouched = new Set([...Object.keys(opened), ...Object.keys(closed)]);
-    for (const coin of coinsTouched) {
-      const state   = openNow[coin];          // undefined if flat *now*
-      const sideNow = state?.side ?? null;
+    /* ── 4️⃣  evaluate every coin touched ───────────────────────────── */
+    const allCoins = new Set([...Object.keys(opened), ...Object.keys(closed)]);
+    for (const coin of allCoins) {
+      const state   = openNow[coin];          // undefined ⇒ flat now
+      const sideNow = state?.side;
 
-      // amounts
-      const openLong  = opened[coin]?.longUsd  || 0;
-      const openShort = opened[coin]?.shortUsd || 0;
-      const closeLong = closed[coin]?.longUsd  || 0;
-      const closeShort= closed[coin]?.shortUsd || 0;
+      const openLong   = opened[coin]?.longUsd  || 0;
+      const openShort  = opened[coin]?.shortUsd || 0;
+      const closeLong  = closed[coin]?.longUsd  || 0;
+      const closeShort = closed[coin]?.shortUsd || 0;
 
       const reduced = (sideNow === "long"  && closeLong  >= trimUsd) ||
                       (sideNow === "short" && closeShort >= trimUsd) ||
-                      (!state && (closeLong + closeShort) >= trimUsd);   // fully closed
+                      (!state && (closeLong + closeShort) >= trimUsd);
 
       const added   = state && (
                       (sideNow === "long"  && openLong  >= addUsd) ||
@@ -1078,21 +1083,24 @@ async function runPositionDeltaPulse({ addrList }, p = {}) {
       const openedFresh = !state && (openLong + openShort) >= newUsd;
 
       if (reduced || added || openedFresh) {
-        return {
+        results.push({
           wallet: addr,
           action: reduced ? "reduced" : added ? "added" : "opened",
           coin:   `${coin}-PERP`,
-          side:   state ? sideNow : (openLong > 0 ? "long" : "short"),
+          side:   state ? sideNow
+                        : (openLong > 0 ? "long" : "short"),
           sizeUsd: state ? big$(state.sizeUsd) : "0.00",
-          avgEntry: state ? big$(state.entry) : "—",
-          liqPx:    state ? big$(state.liqPx) : "—"
-        };
+          avgEntry: state ? big$(state.entry)  : "—",
+          liqPx:    state ? big$(state.liqPx)  : "—"
+        });
+        if (results.length >= maxHits) return results;
       }
     }
   }
 
-  return { result: "no-setup" };
+  return results.length ? results : { result: "no-setup" };
 }
+
 
 
 // strategy registry
