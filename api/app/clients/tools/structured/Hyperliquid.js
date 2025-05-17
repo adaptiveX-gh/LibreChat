@@ -90,6 +90,12 @@ const cached = (fn, ttlMs = 60_000) => {
   };
 };
 
+function chunk(arr, size) {
+  const out = [];
+  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+  return out;
+}
+
 // retry wrapper (handles 429 / 5xx briefly)
 async function hlPost(body, retries = 3) {
   for (let i = 0; i < retries; i++) {
@@ -891,7 +897,7 @@ async function runOpenInterestPulse({ addrList }, p = {}) {
    *    { coin, startOi, endOi }
    * ----------------------------------------------------- */
   const { data: oiHist } = await hlPost({
-    type: "openInterestsHistory",
+    type: "openInterestHistory",
     startTime: Math.floor(start / 1000),
     endTime:   Math.floor(end   / 1000)
   });
@@ -1036,7 +1042,7 @@ ticker (tickerLookup), params{} (mode-specific knobs).`;
     useSheet: z.boolean().optional().default(false),
     minWinrate: z.number().optional().default(0),
     minDuration: z.number().optional().default(0),
-    hours: z.number().int().min(1).max(168).default(1).optional(),
+    hours: z.number().int().min(0).max(168).default(1).optional(),
     minutes: z.number().int().min(1).max(59).optional(),
     positions: z.boolean().optional().default(false),
     
@@ -1049,87 +1055,112 @@ ticker (tickerLookup), params{} (mode-specific knobs).`;
     this.restBase = fields.HYPERLIQUID_API_URL || API_HL;
   }
 
-  async _call(args) {
+  
+
+  /* ────────────────────────────────────────────────────────────
+   *  _call – unified entry
+   *    • accepts hours ≥ 0  (minutes overrides hours when present)
+   *    • silently chunks >20 addresses (HL hard-fails on long arrays)
+   *    • pushes addrList through to every strategy in the same shape
+   * ──────────────────────────────────────────────────────────── */
+  async _call(raw) {
+    // ① pull out top-level args, leave the rest in raw for later
     const {
-      mode = "walletSummary",
-      params = {},
-      addresses = [],
-      useBrowse = false,
-      useSheet = false,
+      mode       = "walletSummary",
+      params     = {},
+      addresses  = [],
+      useBrowse  = false,
+      useSheet   = false,
       minWinrate = 0,
-      minDuration = 0,
-      hours = 1,
-      positions = false,
+      minDuration= 0,
+      hours      = 1,
+      minutes,
+      positions  = false,
       ticker
-    } = args;
+    } = raw;
 
-    // fast paths for new modes first
-    if (mode !== "walletSummary") {
-      if (!strategies[mode]) return `❌ unknown mode ${mode}`;
-      // some modes (tickerLookup) need only params; others need addr list
-      const extra = { addrList: addresses };
-      const out = await strategies[mode](
-        { ...extra },
-        { ...params, ticker }
-      );
-      return JSON.stringify(out, null, 2);
-    }
+    /* -------------------------------------------------------- *
+     * Build the wallet universe
+     * -------------------------------------------------------- */
+    let addrList = [...addresses];                     // shallow copy
 
-    // ───── legacy walletSummary branch (mostly unchanged) ─────
-    let addrList = addresses;
     if (useBrowse || useSheet || !addrList.length) {
-      let rows = [];
-      if (useBrowse) rows = await fetchBrowseRows();
-      else if (useSheet) rows = await fetchSheetRows();
+      const rows = useBrowse ? await fetchBrowseRows()
+                             : await fetchSheetRows();
       addrList = rows
         .filter(r => r.winrate >= minWinrate && r.duration >= minDuration)
         .map(r => r.addr);
-      if (!addrList.length)
-        return JSON.stringify({ error: "No traders passed the filter." }, null, 2);
     }
+
+    if (!addrList.length)
+      return JSON.stringify({ error: "No wallets to analyse." }, null, 2);
 
     const bad = addrList.filter(a => !ETH_RE.test(a));
-    if (bad.length) return `❌ Invalid address(es): ${bad.join(", ")}`;
+    if (bad.length)
+      return `❌ Invalid address(es): ${bad.join(", ")}`;
 
-    const now = Date.now();
+    /* -------------------------------------------------------- *
+     * Decide the time window
+     * -------------------------------------------------------- */
+    const lookbackMs = typeof minutes === "number"
+      ? minutes * 60_000
+      : Math.max(0, hours) * MS_HOUR;
 
-    let lookbackMs;
-    if (typeof args.minutes === "number") {
-      // minutes field overrides hours when present
-      lookbackMs = args.minutes * 60_000;
-    } else {
-      lookbackMs = hours * 3_600_000;          // default behaviour
+    /* -------------------------------------------------------- *
+     * Fast-path: any advanced mode except walletSummary
+     * -------------------------------------------------------- */
+    if (mode !== "walletSummary") {
+      const runner = strategies[mode];
+      if (!runner) return `❌ unknown mode ${mode}`;
+
+      // Each strategy gets addrList but **internally** they chunk
+      // if they call /info userFillsByTime
+      const out = await runner({ addrList }, { ...params, ticker, lookbackMs });
+      return JSON.stringify(out, null, 2);
     }
+
+    /* -------------------------------------------------------- *
+     * Legacy walletSummary (uses chunk() helper)
+     * -------------------------------------------------------- */
+    const now       = Date.now();
     const startTime = now - lookbackMs;
 
+    const batches   = chunk(addrList, 20);             // HL happy size
+    const fillsRaw  = [];
 
-    const fills = await Promise.all(
-      addrList.map(addr =>
-        limit(async () => {
-          try {
-            const { data } = await hlPost({
-              type: "userFillsByTime",
-              user: addr,
-              startTime,
-              endTime: now,
-              aggregateByTime: false
-            });
-            return { address: addr, fills: (data || []).slice(-MAX_FILLS), truncated: (data || []).length > MAX_FILLS };
-          } catch (e) {
-            const msg = e.response ? JSON.stringify(e.response.data) : e.message;
-            return { address: addr, error: msg };
-          }
-        })
-      )
-    );
+    for (const batch of batches) {
+      const fillsBatch = await Promise.all(
+        batch.map(addr =>
+          limit(async () => {
+            try {
+              const { data } = await hlPost({
+                type:       "userFillsByTime",
+                user:       addr,
+                startTime,
+                endTime:    now,
+                aggregateByTime: false
+              });
+              return {
+                address:    addr,
+                fills:      (data || []).slice(-MAX_FILLS),
+                truncated:  (data || []).length > MAX_FILLS
+              };
+            } catch (e) {
+              const msg = e.response ? JSON.stringify(e.response.data) : e.message;
+              return { address: addr, error: msg };
+            }
+          })
+        )
+      );
+      fillsRaw.push(...fillsBatch);
+    }
 
+    // attach insights & open positions
     const summary = await Promise.all(
-      fills.map(async r => {
-        if (r.error) return { address: r.address, error: r.error };
+      fillsRaw.map(async r => {
+        if (r.error) return r;
         const o = {
-          address: r.address,
-          fills: r.fills,
-          truncated: r.truncated,
+          ...r,
           insights: analyseFills(r.fills)
         };
         if (positions) {
@@ -1141,6 +1172,7 @@ ticker (tickerLookup), params{} (mode-specific knobs).`;
 
     return JSON.stringify(summary, null, 2);
   }
+
 }
 
 module.exports = HyperliquidAPI;
