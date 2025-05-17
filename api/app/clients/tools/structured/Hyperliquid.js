@@ -16,7 +16,8 @@
  *   • mode:"compressionRadar"      → tight range ≤ bp + whale build ≥ $X
  *   • mode:"trendBias" → ranked net build over last N minutes (default 15 m) params: { windowMs, minNotional, topN }
  *   • mode:"liquidationSweep"      → list all liquidations in the last N seconds
- *   • mode:"openInterestPulse" → OI jump ≥ $X + wallets net same side
+ *   • mode:"openInterestPulse"     → OI jump ≥ $X + wallets net same side
+ *   • mode:"positionDeltaPulse"
  * ─────────────────────────────────────────────────────────────
  */
 
@@ -989,6 +990,94 @@ async function runOpenInterestPulse({ addrList }, p = {}) {
   return { result: "no-setup" };
 }
 
+/**
+ * runPositionDeltaPulse – detect large position changes by a single wallet
+ * params:
+ *   windowMs   default 600_000  (10 min)
+ *   trimUsd    default 250_000  (closed against current side)
+ *   addUsd     default 250_000  (opened with current side)
+ *   newUsd     default 250_000  (brand-new position size)
+ */
+async function runPositionDeltaPulse({ addrList }, p = {}) {
+  const {
+    windowMs = 600_000,
+    trimUsd  = 250_000,
+    addUsd   = 250_000,
+    newUsd   = 250_000
+  } = p;
+
+  const end   = Date.now();
+  const start = end - windowMs;
+
+  // analyse each wallet one-by-one (cheap, avoids batching hassle)
+  for (const addr of addrList) {
+    const [{ data: fills = [] } = {} , { data: ch = {} } = {}] =
+      await Promise.all([
+        hlPost({
+          type: "userFillsByTime",
+          user: addr,
+          startTime: start,
+          endTime:   end,
+          aggregateByTime: false
+        }),
+        hlPost({ type: "clearinghouseState", user: addr })
+      ]).catch(() => []);
+
+    const pos = (ch.assetPositions || [])
+                  .find(p => +p.position.szi !== 0);
+    if (!pos) continue;                       // the trader is flat now
+
+    const sideNow   = +pos.position.szi > 0 ? "long" : "short";
+    const absSize   = Math.abs(+pos.position.szi) * +pos.position.entryPx;
+    const liqPx     = +pos.position.liquidationPx;
+    const avgEntry  = +pos.position.entryPx;
+
+    let closedUsdLong = 0, closedUsdShort = 0;
+    let openedUsdLong = 0, openedUsdShort = 0;
+
+    for (const f of fills) {
+      const usd = Math.abs(+f.sz) * +f.px;
+      if (f.dir.startsWith("Close")) {
+        if (f.dir.includes("Long"))  closedUsdLong  += usd;
+        if (f.dir.includes("Short")) closedUsdShort += usd;
+      }
+      if (f.dir.startsWith("Open")) {
+        if (f.dir.includes("Long"))  openedUsdLong  += usd;
+        if (f.dir.includes("Short")) openedUsdShort += usd;
+      }
+    }
+
+    // ---------- classify the event ----------
+    const reduced = (sideNow === "long"  && closedUsdLong  >= trimUsd) ||
+                    (sideNow === "short" && closedUsdShort >= trimUsd);
+
+    const added   = (sideNow === "long"  && openedUsdLong  >= addUsd) ||
+                    (sideNow === "short" && openedUsdShort >= addUsd);
+
+    const openedFresh = !reduced && !added &&            // no conflicting deltas
+                        ((sideNow === "long"  && openedUsdLong  >= newUsd) ||
+                         (sideNow === "short" && openedUsdShort >= newUsd));
+
+    if (!(reduced || added || openedFresh)) continue;    // nothing big
+
+    const action = reduced ? "reduced"
+                 : added   ? "added"
+                 : "opened";
+
+    return {
+      wallet:  addr,
+      action,                          // "reduced" | "added" | "opened"
+      coin:    `${pos.position.coin}-PERP`,
+      side:    sideNow,
+      sizeUsd: big$(absSize),
+      avgEntry: big$(avgEntry),
+      liqPx:   big$(liqPx)
+    };
+  }
+
+  return { result: "no-setup" };
+}
+
 
 // strategy registry
 const strategies = {
@@ -1001,7 +1090,9 @@ const strategies = {
   liquidationSniper: async (a, p) => runLiquidationSniper(a, p),
   compressionRadar: async (a,p)=>runCompressionRadar(a,p),
   trendBias: async (a,p)=>runTrendBias(a,p),
-  openInterestPulse: async (a,p)=>runOpenInterestPulse(a,p)
+  openInterestPulse: async (a,p)=>runOpenInterestPulse(a,p),
+  positionDeltaPulse: async (a,p)=>runPositionDeltaPulse(a,p)
+
 };
 
 // ─────────────────────────────────────────────────────────────
@@ -1033,7 +1124,8 @@ ticker (tickerLookup), params{} (mode-specific knobs).`;
       "compressionRadar",
       "topMoverPulse",
       "openInterestPulse",
-      "trendBias"
+      "trendBias",
+      "positionDeltaPulse"  
     ]).default("walletSummary").optional(),
     params: z.record(z.any()).optional(),
 
