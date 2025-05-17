@@ -426,8 +426,6 @@ async function runTopMover({ addrList, windowMs = 300_000 }) {
 }
 
 // stubs for other strategies (return 'no-setup' for now)
-const runDivergence = async () => ({ result: "no-divergence" });
-const runCompressionRadar = async () => ({ result: "no-compression" });
 const runTrendBias = async () => ({ result: "no-trend" });
 
 async function runLiquidationSniper({ addrList }, p = {}) {
