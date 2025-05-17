@@ -16,6 +16,7 @@
  *   • mode:"compressionRadar"      → tight range ≤ bp + whale build ≥ $X
  *   • mode:"trendBias" → ranked net build over last N minutes (default 15 m) params: { windowMs, minNotional, topN }
  *   • mode:"liquidationSweep"      → list all liquidations in the last N seconds
+ *   • mode:"openInterestPulse" → OI jump ≥ $X + wallets net same side
  * ─────────────────────────────────────────────────────────────
  */
 
@@ -865,6 +866,122 @@ async function runCompressionRadar({ addrList }, p = {}) {
   return { result: "no-compression" };
 }
 
+/**
+ * runOpenInterestPulse – OI jump + whale confirmation
+ * params:
+ *   windowMs       default 600_000  (10 min)
+ *   deltaUsd       default 250_000  (minimum OI change)
+ *   minWallets     default 3        (wallets on same side)
+ *   side           "long" | "short" | "both" (default "long")
+ */
+async function runOpenInterestPulse({ addrList }, p = {}) {
+  const {
+    windowMs   = 600_000,
+    deltaUsd   = 250_000,
+    minWallets = 3,
+    side       = "long"   // or "short" or "both"
+  } = p;
+
+  const end   = Date.now();
+  const start = end - windowMs;
+
+  /* ----------------------------------------------------- *
+   * 1️⃣  Open-interest Δ
+   * Hyperliquid supports type:"openInterestsHistory"
+   *    { coin, startOi, endOi }
+   * ----------------------------------------------------- */
+  const { data: oiHist } = await hlPost({
+    type: "openInterestsHistory",
+    startTime: Math.floor(start / 1000),
+    endTime:   Math.floor(end   / 1000)
+  });
+  if (!Array.isArray(oiHist) || !oiHist.length) return { result: "no-data" };
+
+  // map coin → { Δusd, pct }
+  const oiChange = {};
+  for (const row of oiHist) {
+    const d = +row.endOi.usd - +row.startOi.usd;
+    if (Math.abs(d) >= deltaUsd) {
+      oiChange[row.coin] = {
+        deltaUsd: d,
+        pct: (+row.startOi.usd === 0 ? 0 :
+              100 * d / +row.startOi.usd)
+      };
+    }
+  }
+  if (!Object.keys(oiChange).length) return { result: "no-oi-move" };
+
+  /* ----------------------------------------------------- *
+   * 2️⃣  Wallet net flow in same window
+   * ----------------------------------------------------- */
+  const fillsResp = await Promise.all(
+    addrList.map(addr =>
+      limit(async () => {
+        try {
+          const { data } = await hlPost({
+            type: "userFillsByTime",
+            user: addr,
+            startTime: start,
+            endTime:   end,
+            aggregateByTime: false
+          });
+          return { addr, fills: data || [] };
+        } catch { return { addr, fills: [] }; }
+      })
+    )
+  );
+
+  const flow = {}; // coin → { net, wallets:Set, details:{} }
+  for (const r of fillsResp) {
+    let perCoin = {};
+    for (const f of r.fills) {
+      const n = Math.abs(+f.sz) * +f.px;
+      const sign = f.dir.includes("Long")
+                    ? (f.dir.startsWith("Close") ? -1 : +1)
+                    : (f.dir.startsWith("Close") ? +1 : -1);
+      perCoin[f.coin] = (perCoin[f.coin] || 0) + n * sign;
+    }
+    for (const [coin, delta] of Object.entries(perCoin)) {
+      if (!flow[coin]) flow[coin] = { net: 0, wallets:new Set(), details:{} };
+      flow[coin].net += delta;
+      flow[coin].wallets.add(r.addr);
+      flow[coin].details[r.addr] = delta;
+    }
+  }
+
+  /* ----------------------------------------------------- *
+   * 3️⃣  Cross-check OI jump + wallet bias
+   * ----------------------------------------------------- */
+  for (const [coin, change] of Object.entries(oiChange)) {
+    const f = flow[coin];
+    if (!f) continue;
+
+    const wantedLong  = side === "long"  || side === "both";
+    const wantedShort = side === "short" || side === "both";
+
+    const bias = f.net > 0 ? "long" : (f.net < 0 ? "short" : "flat");
+    if ((bias === "long"  && !wantedLong)  ||
+        (bias === "short" && !wantedShort)) continue;
+
+    if (f.wallets.size < minWallets) continue;
+
+    const topBuilders = Object.entries(f.details)
+      .sort((a,b)=>Math.abs(b[1])-Math.abs(a[1]))
+      .slice(0,5)
+      .map(([addr,delta])=>({ addr, delta: big$(delta) }));
+
+    return {
+      coin: `${coin}-PERP`,
+      deltaOiUsd: big$(Math.abs(change.deltaUsd)),
+      pctChange:  `${change.pct.toFixed(1)}%`,
+      side: bias,
+      walletCount: f.wallets.size,
+      topBuilders
+    };
+  }
+
+  return { result: "no-setup" };
+}
 
 
 // strategy registry
@@ -877,7 +994,8 @@ const strategies = {
   divergenceRadar: async (a,p)=>runDivergence(a,p),
   liquidationSniper: async (a, p) => runLiquidationSniper(a, p),
   compressionRadar: async (a,p)=>runCompressionRadar(a,p),
-  trendBias: async (a,p)=>runTrendBias(a,p)
+  trendBias: async (a,p)=>runTrendBias(a,p),
+  openInterestPulse: async (a,p)=>runOpenInterestPulse(a,p)
 };
 
 // ─────────────────────────────────────────────────────────────
@@ -908,6 +1026,7 @@ ticker (tickerLookup), params{} (mode-specific knobs).`;
       "liquidationSniper",
       "compressionRadar",
       "topMoverPulse",
+      "openInterestPulse",
       "trendBias"
     ]).default("walletSummary").optional(),
     params: z.record(z.any()).optional(),
@@ -920,6 +1039,7 @@ ticker (tickerLookup), params{} (mode-specific knobs).`;
     hours: z.number().int().min(1).max(168).default(1).optional(),
     minutes: z.number().int().min(1).max(59).optional(),
     positions: z.boolean().optional().default(false),
+    
 
     ticker: z.string().optional() // legacy convenience
   });
