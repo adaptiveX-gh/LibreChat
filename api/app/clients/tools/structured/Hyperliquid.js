@@ -1,44 +1,58 @@
 /**
  * hyperliquid.js  —  LangChain Tool
  *
- * v2  ·  2025-05-16
+ * v3  ·  2025-05-16
  * ─────────────────────────────────────────────────────────────
- * ➊ Whale-analysis of trader wallets
- * ➋ Ticker-lookup (“Is SOL tradable, spot or perp?”)
+ *  modes:
+ *   • walletSummary   (default)   – existing whale-analysis
+ *   • tickerLookup                – “is SOL tradable?”
+ *   • divergenceRadar             – profit-take vs build divergence
+ *   • liquidationSniper           – whales fade liquidations
+ *   • compressionRadar            – tight range + heavy build
+ *   • topMoverPulse               – biggest 5-min net change
+ *   • trendBias                   – 15-min same-side accumulation
  * ─────────────────────────────────────────────────────────────
  */
 
-const axios  = require("axios");
+const axios = require("axios");
 const { Tool } = require("@langchain/core/tools");
-const { z }    = require("zod");
+const { z } = require("zod");
 
 // ─────────────────────────────────────────────────────────────
-// 0.  ENV & constants
+// 0. ENV & constants
 // ─────────────────────────────────────────────────────────────
-const API_HL   = process.env.HYPERLIQUID_API_URL || "https://api.hyperliquid.xyz";
-const API_BAI  = "https://api.browse.ai/v2";
-const MS_HOUR  = 3_600_000;
+const API_HL = process.env.HYPERLIQUID_API_URL || "https://api.hyperliquid.xyz";
+const API_BAI = "https://api.browse.ai/v2";
+const MS_HOUR = 3_600_000;
 
-const ETH_RE   = /^0x[0-9a-fA-F]{40}$/;
-const big$     = n => (+n).toLocaleString("en-US",
-                    { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const ETH_RE = /^0x[0-9a-fA-F]{40}$/;
+const big$ = n =>
+  (+n).toLocaleString("en-US", {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2
+  });
 
 // Browse AI creds
-const { BROWSEAI_API_KEY:  BAI_KEY,
-        BROWSEAI_TEAM_ID:  BAI_TEAM,
-        BROWSEAI_ROBOT_ID: BAI_ROBOT } = process.env;
+const {
+  BROWSEAI_API_KEY: BAI_KEY,
+  BROWSEAI_TEAM_ID: BAI_TEAM,
+  BROWSEAI_ROBOT_ID: BAI_ROBOT
+} = process.env;
 
 // Google Sheet creds
-const { GOOGLE_SHEET_ID:  GS_ID,
-        GOOGLE_SHEET_GID: GS_GID = 0 } = process.env;
+const {
+  GOOGLE_SHEET_ID: GS_ID,
+  GOOGLE_SHEET_GID: GS_GID = 0
+} = process.env;
 
-// thresholds for Hyperliquid insight detection
-const BIG_NOTIONAL = 50_000;   // USD
-const DRIP_COUNT   = 15;
-const DRIP_SIZE    = 500;
+// insight thresholds
+const BIG_NOTIONAL = 50_000; // USD
+const DRIP_COUNT = 15;
+const DRIP_SIZE = 500;
+const MAX_FILLS = 400; // slice fills returned
 
 // ─────────────────────────────────────────────────────────────
-// 1.  Tiny concurrency limiter (≈ p-limit in 12 lines)
+// 1. small helpers
 // ─────────────────────────────────────────────────────────────
 function limiter(max = 4) {
   let active = 0;
@@ -48,66 +62,109 @@ function limiter(max = 4) {
     const { fn, res, rej } = q.shift();
     active++;
     fn().then(res).catch(rej).finally(() => {
-      active--; next();
+      active--;
+      next();
     });
   }
-  return fn => new Promise((res, rej) => { q.push({ fn, res, rej }); next(); });
+  return fn => new Promise((res, rej) => {
+    q.push({ fn, res, rej });
+    next();
+  });
 }
-const limit = limiter(4);
+const limit = limiter(6);
+
+// simple in-memory ttl cache
+const cached = (fn, ttlMs = 60_000) => {
+  let value, expiry = 0;
+  return async (...a) => {
+    if (Date.now() < expiry) return value;
+    value = await fn(...a);
+    expiry = Date.now() + ttlMs;
+    return value;
+  };
+};
+
+// retry wrapper (handles 429 / 5xx briefly)
+async function hlPost(body, retries = 3) {
+  for (let i = 0; i < retries; i++) {
+    try {
+      return await axios.post(
+        `${API_HL}/info`,
+        body,
+        { headers: { "Content-Type": "application/json" }, timeout: 6000 }
+      );
+    } catch (e) {
+      if (i === retries - 1) throw e;
+      const shouldBackoff = e.response?.status === 429 || e.code === "ECONNABORTED";
+      if (shouldBackoff) await new Promise(r => setTimeout(r, 500 * (i + 1)));
+    }
+  }
+}
+
+// bucket utility
+const bucketize = (ts, sizeMs) => Math.floor(ts / sizeMs) * sizeMs;
 
 // ─────────────────────────────────────────────────────────────
-// 2A.  Browse AI helper (unchanged)
+// 2. cached meta + extra endpoints
+// ─────────────────────────────────────────────────────────────
+const getPerpMeta = cached(async () => {
+  const { data } = await hlPost({ type: "meta" });
+  return data.universe ?? [];
+});
+
+const getSpotMeta = cached(async () => {
+  const { data } = await hlPost({ type: "spotMeta" });
+  return data.universe ?? [];
+});
+
+async function fetchLiquidations(start, end) {
+  const { data } = await hlPost({ type: "liquidations", startTime: start, endTime: end });
+  return data.events ?? [];
+}
+
+async function fetchOpenInterests() {
+  const { data } = await hlPost({ type: "openInterests" });
+  return data ?? {};
+}
+
+// ─────────────────────────────────────────────────────────────
+// 3. existing helpers (browse, sheet, analyseFills, openPositions)
 // ─────────────────────────────────────────────────────────────
 async function fetchBrowseRows() {
-  if (!BAI_KEY || !BAI_TEAM || !BAI_ROBOT) {
-    throw new Error("Browse AI creds missing in env");
-  }
-
-  // most-recent successful task
+  if (!BAI_KEY || !BAI_TEAM || !BAI_ROBOT) throw new Error("Browse AI creds missing");
   const taskList = await axios.get(
     `${API_BAI}/robots/${BAI_ROBOT}/tasks`,
     { params: { teamId: BAI_TEAM, status: "successful", limit: 1, page: 1 },
       headers: { Authorization: `Bearer ${BAI_KEY}` } }
   );
   if (!taskList.data.tasks?.length) return [];
-
   const taskId = taskList.data.tasks[0].id;
-  const task   = await axios.get(
+  const task = await axios.get(
     `${API_BAI}/tasks/${taskId}`,
     { headers: { Authorization: `Bearer ${BAI_KEY}` } }
   );
-
   const rows = task.data.result?.tables?.[0]?.rows || [];
   return rows.map(r => ({
-      addr:    (r["Origin URL"] || "").match(ETH_RE)?.[0] || null,
-      winrate: Number((r["Winrate"] || "").match(/([\d.]+)/)?.[1] || 0),
-      duration: (() => {
-        const [h, m] = (r["Duration"] || "").split(/[hm]/).filter(Boolean);
-        return (+h || 0) + (+m || 0) / 60;
-      })()
+    addr: (r["Origin URL"] || "").match(ETH_RE)?.[0] || null,
+    winrate: Number((r["Winrate"] || "").match(/([\d.]+)/)?.[1] || 0),
+    duration: (() => {
+      const [h, m] = (r["Duration"] || "").split(/[hm]/).filter(Boolean);
+      return (+h || 0) + (+m || 0) / 60;
+    })()
   })).filter(r => r.addr);
 }
 
-// ─────────────────────────────────────────────────────────────
-// 2B.  Google Sheet helper (no external deps)
-// ─────────────────────────────────────────────────────────────
 async function fetchSheetRows() {
-  if (!GS_ID) throw new Error("GOOGLE_SHEET_ID env var missing");
-
+  if (!GS_ID) throw new Error("GOOGLE_SHEET_ID missing");
   const url = `https://docs.google.com/spreadsheets/d/${GS_ID}/gviz/tq?tqx=out:csv&gid=${GS_GID}`;
   const { data: csv } = await axios.get(url);
-
-  const lines   = csv.trim().split(/\r?\n/);
+  const lines = csv.trim().split(/\r?\n/);
   const headers = lines[0].split(",").map(h => h.trim().toLowerCase());
-
   return lines.slice(1).map(line => {
     const cols = line.split(",").map(c => c.trim());
-    const obj  = Object.fromEntries(headers.map((h, i) => [h, cols[i] || ""]));
-
-    // expected cols: wallet | winrate | duration
+    const obj = Object.fromEntries(headers.map((h, i) => [h, cols[i] || ""]));
     const addr = obj.wallet?.toLowerCase() || "";
     if (!ETH_RE.test(addr)) return null;
-
     const win = Number((obj.winrate || "").replace("%", ""));
     const dur = (() => {
       const hr = (obj.duration.match(/(\d+)\s*h/i) || [])[1];
@@ -115,34 +172,24 @@ async function fetchSheetRows() {
       if (hr || mn) return (+hr || 0) + (+mn || 0) / 60;
       return Number(obj.duration) || 0;
     })();
-
     return { addr, winrate: win, duration: dur };
   }).filter(Boolean);
 }
 
-// ─────────────────────────────────────────────────────────────
-// 3.  Hyperliquid insight helpers
-// ─────────────────────────────────────────────────────────────
 function analyseFills(fills = []) {
   const out = { profitTakes: [], flips: [], newBuilds: [], dripStyle: false };
   if (!fills.length) return out;
-
-  const lastSide = {}; // coin → "long"/"short"
-
+  const lastSide = {};
   for (const f of fills) {
-    const coin     = f.coin.toUpperCase();
+    const coin = f.coin.toUpperCase();
     const notional = Math.abs(+f.sz) * +f.px;
     const sideWord = f.dir.includes("Long") ? "long" : "short";
-
-    // profit takes
     if (f.dir.startsWith("Close") && notional >= BIG_NOTIONAL) {
       out.profitTakes.push({
         coin, dir: f.dir, size: big$(f.sz), px: big$(f.px),
         pnl: big$(f.closedPnl), ts: f.time
       });
     }
-
-    // flips
     if (f.dir.startsWith("Close")) {
       lastSide[coin] = sideWord;
     } else if (f.dir.startsWith("Open")) {
@@ -154,40 +201,30 @@ function analyseFills(fills = []) {
       }
       lastSide[coin] = sideWord;
     }
-
-    // new builds
     if (f.dir.startsWith("Open") && notional >= BIG_NOTIONAL) {
       out.newBuilds.push({
         coin, dir: f.dir, size: big$(f.sz), px: big$(f.px), ts: f.time
       });
     }
   }
-
-  // drip scalping
   const tinyCloses = fills.filter(
     f => f.dir.startsWith("Close") && Math.abs(+f.sz) * +f.px <= DRIP_SIZE
   );
   out.dripStyle = tinyCloses.length >= DRIP_COUNT;
-
   return out;
 }
 
 async function fetchOpenPositions(base, addr) {
   try {
-    const { data } = await axios.post(
-      `${base}/info`,
-      { type: "clearinghouseState", user: addr },
-      { headers: { "Content-Type": "application/json" } }
-    );
-
+    const { data } = await hlPost({ type: "clearinghouseState", user: addr });
     return (data.assetPositions || [])
       .filter(p => +p.position.szi !== 0)
       .map(p => ({
-        coin:  p.position.coin,
-        side:  +p.position.szi > 0 ? "long" : "short",
-        size:  big$(p.position.szi),
+        coin: p.position.coin,
+        side: +p.position.szi > 0 ? "long" : "short",
+        size: big$(p.position.szi),
         entry: big$(p.position.entryPx),
-        upnl:  big$(p.position.unrealizedPnl),
+        upnl: big$(p.position.unrealizedPnl),
         liqPx: big$(p.position.liquidationPx)
       }));
   } catch (e) {
@@ -197,41 +234,143 @@ async function fetchOpenPositions(base, addr) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// 4.  LangChain Tool
+// 4. strategy implementations (simplified but functional)
+// ─────────────────────────────────────────────────────────────
+async function runTickerLookup({ ticker }) {
+  const raw = ticker.toUpperCase().trim();
+  const clean = raw.replace(/[-_ ]?(PERP)$/i, "");
+  const baseSym = clean.split(/[\/\-_ ]/)[0];
+
+  const [perpMeta, spotMeta] = await Promise.all([getPerpMeta(), getSpotMeta()]);
+  const perpCoins = perpMeta.map(u => u.name.toUpperCase());
+  const spotPairs = spotMeta.map(u => u.name.toUpperCase());
+
+  const inPerp = perpCoins.includes(baseSym);
+  const inSpot = spotPairs.some(
+    p => p === clean || p.startsWith(`${baseSym}/`) || p.endsWith(`/${baseSym}`)
+  );
+  return {
+    ticker: raw,
+    available: inPerp || inSpot,
+    perp: inPerp,
+    spot: inSpot,
+    spotPairs: inSpot ? spotPairs.filter(p => p.includes(baseSym)).sort() : []
+  };
+}
+
+// walletSummary is the legacy path (implemented later)
+
+// very-light “topMoverPulse” proof-of-concept
+async function runTopMover({ addrList, windowMs = 300_000 }) {
+  const end = Date.now();
+  const start = end - windowMs;
+
+  const fillsResp = await Promise.all(
+    addrList.map(addr =>
+      limit(async () => {
+        try {
+          const { data } = await hlPost({
+            type: "userFillsByTime",
+            user: addr,
+            startTime: start,
+            endTime: end,
+            aggregateByTime: false
+          });
+          return { addr, fills: data || [] };
+        } catch (e) {
+          return { addr, fills: [] };
+        }
+      })
+    )
+  );
+
+  const coinNet = {}; // coin → { side, notional, wallets: Set }
+  for (const r of fillsResp) {
+    for (const f of r.fills) {
+      const n = Math.abs(+f.sz) * +f.px;
+      const side = f.dir.includes("Long") ? (f.dir.startsWith("Close") ? -1 : +1)
+                                          : (f.dir.startsWith("Close") ? +1 : -1);
+      if (!coinNet[f.coin]) coinNet[f.coin] = { net: 0, wallets: {}, side: 0 };
+      coinNet[f.coin].net += n * side;
+      coinNet[f.coin].wallets[r.addr] = (coinNet[f.coin].wallets[r.addr] || 0) + n * side;
+    }
+  }
+
+  const sorted = Object.entries(coinNet)
+    .sort((a, b) => Math.abs(b[1].net) - Math.abs(a[1].net));
+  const [topCoin, info] = sorted[0] || [];
+  if (!topCoin) return { note: "no-fills" };
+
+  const topMovers = Object.entries(info.wallets)
+    .sort((a, b) => Math.abs(b[1]) - Math.abs(a[1]))
+    .slice(0, 3)
+    .map(([addr, delta]) => ({ addr, delta: big$(delta) }));
+
+  return {
+    coin: `${topCoin}-PERP`,
+    netDelta: `${big$(Math.abs(info.net))} ${info.net > 0 ? "longs" : "shorts"}`,
+    walletCount: Object.keys(info.wallets).length,
+    topMovers
+  };
+}
+
+// stubs for other strategies (return 'no-setup' for now)
+const runDivergence = async () => ({ result: "no-divergence" });
+const runLiquidationSniper = async () => ({ result: "no-setup" });
+const runCompressionRadar = async () => ({ result: "no-compression" });
+const runTrendBias = async () => ({ result: "no-trend" });
+
+// strategy registry
+const strategies = {
+  tickerLookup: async (_args, params) => runTickerLookup(params),
+  topMoverPulse: async (args, params) => runTopMover({ ...params, ...args }),
+  divergenceRadar: runDivergence,
+  liquidationSniper: runLiquidationSniper,
+  compressionRadar: runCompressionRadar,
+  trendBias: runTrendBias
+};
+
+// ─────────────────────────────────────────────────────────────
+// 5. LangChain Tool
 // ─────────────────────────────────────────────────────────────
 class HyperliquidAPI extends Tool {
   name = "hyperliquid";
-
   description = `
-Analyse Hyperliquid whale activity **or** query whether a ticker is tradable.
+Query Hyperliquid blockchain data.
 
-Source modes (choose one):
-• "addresses": [...]  – explicit wallet list
-• "useBrowse": true   – pull from Browse AI robot table
-• "useSheet":  true   – pull from Google Sheet CSV
-• "ticker":    "SOL"  – lookup mode (returns perp/spot availability)
+• mode:"tickerLookup"              → { ticker, available, perp, spot, spotPairs[] }
+• mode:"walletSummary"  (default)  → [{ address, fills, insights, openPositions? }]
+• mode:"topMoverPulse"             → biggest net move last 5m
+• mode:"divergenceRadar"           → profit-take vs build (cluster)
+• mode:"liquidationSniper"         → whales fade liquidation cascade
+• mode:"compressionRadar"          → tight range + accumulation
+• mode:"trendBias"                 → same-side build 15 min
 
-Optional filters (browse / sheet):
-• minWinrate – %  (default 0)
-• minDuration – h (default 0)
-
-Other options:
-• hours     – look-back window for fills (default 1)
-• positions – include open positions in the output
-
-Returns either:
-• Ticker info → { ticker, available, perp, spot, spotPairs[] }
-• Wallet summary → [{ address, fills, insights, openPositions? }]`;
+Common optional fields:
+addresses[], useBrowse, useSheet, minWinrate, minDuration, hours, positions,
+ticker (tickerLookup), params{} (mode-specific knobs).`;
 
   schema = z.object({
-    addresses:   z.array(z.string()).optional(),
-    useBrowse:   z.boolean().optional().default(false),
-    useSheet:    z.boolean().optional().default(false),
-    minWinrate:  z.number().optional().default(0),
+    mode: z.enum([
+      "walletSummary",
+      "tickerLookup",
+      "divergenceRadar",
+      "liquidationSniper",
+      "compressionRadar",
+      "topMoverPulse",
+      "trendBias"
+    ]).default("walletSummary").optional(),
+    params: z.record(z.any()).optional(),
+
+    addresses: z.array(z.string()).optional(),
+    useBrowse: z.boolean().optional().default(false),
+    useSheet: z.boolean().optional().default(false),
+    minWinrate: z.number().optional().default(0),
     minDuration: z.number().optional().default(0),
-    hours:       z.number().int().min(1).max(168).default(1).optional(),
-    positions:   z.boolean().optional().default(false),
-    ticker:      z.string().optional()
+    hours: z.number().int().min(1).max(168).default(1).optional(),
+    positions: z.boolean().optional().default(false),
+
+    ticker: z.string().optional() // legacy convenience
   });
 
   constructor(fields = {}) {
@@ -239,21 +378,13 @@ Returns either:
     this.restBase = fields.HYPERLIQUID_API_URL || API_HL;
   }
 
-  /** @param {{
-   *   addresses?: string[],
-   *   useBrowse?: boolean,
-   *   useSheet?:  boolean,
-   *   minWinrate?: number,
-   *   minDuration?: number,
-   *   hours?: number,
-   *   positions?: boolean,
-   *   ticker?: string
-   * }} args */
   async _call(args) {
     const {
+      mode = "walletSummary",
+      params = {},
       addresses = [],
       useBrowse = false,
-      useSheet  = false,
+      useSheet = false,
       minWinrate = 0,
       minDuration = 0,
       hours = 1,
@@ -261,83 +392,49 @@ Returns either:
       ticker
     } = args;
 
-    // ─────────────── ticker lookup branch ───────────────
-    if (ticker) {
-      const raw     = ticker.toUpperCase().trim();             // user input
-      const clean   = raw.replace(/[-_ ]?(PERP)$/i, "");        // strip -PERP
-      const baseSym = clean.split(/[\/\-_ ]/)[0];              // "SOL" in "SOL/USDC"
-
-      // 1. perp list
-      const { data: perpMeta } = await axios.post(
-        `${this.restBase}/info`,
-        { type: "meta" },
-        { headers: { "Content-Type": "application/json" } }
+    // fast paths for new modes first
+    if (mode !== "walletSummary") {
+      if (!strategies[mode]) return `❌ unknown mode ${mode}`;
+      // some modes (tickerLookup) need only params; others need addr list
+      const extra = { addrList: addresses };
+      const out = await strategies[mode](
+        { ...extra },
+        { ...params, ticker }
       );
-      const perpCoins = (perpMeta.universe ?? []).map(u => u.name.toUpperCase());
-
-      // 2. spot list
-      const { data: spotMeta } = await axios.post(
-        `${this.restBase}/info`,
-        { type: "spotMeta" },
-        { headers: { "Content-Type": "application/json" } }
-      );
-      const spotPairs = (spotMeta.universe ?? []).map(u => u.name.toUpperCase());
-
-      // 3. membership tests
-      const inPerp = perpCoins.includes(baseSym);
-      const inSpot = spotPairs.some(
-        p => p === clean ||
-             p.startsWith(`${baseSym}/`) ||
-             p.endsWith(`/${baseSym}`)
-      );
-      return JSON.stringify({
-        ticker:     raw,
-        available:  inPerp || inSpot,
-        perp:       inPerp,
-        spot:       inSpot,
-        spotPairs:  inSpot ? spotPairs
-                              .filter(p => p.includes(baseSym))
-                              .sort() : []
-      }, null, 2);
+      return JSON.stringify(out, null, 2);
     }
 
-    // ─────────────── whale-analysis branch ───────────────
+    // ───── legacy walletSummary branch (mostly unchanged) ─────
     let addrList = addresses;
-
     if (useBrowse || useSheet || !addrList.length) {
       let rows = [];
-
       if (useBrowse) rows = await fetchBrowseRows();
       else if (useSheet) rows = await fetchSheetRows();
-
       addrList = rows
         .filter(r => r.winrate >= minWinrate && r.duration >= minDuration)
         .map(r => r.addr);
-
-      if (!addrList.length) {
+      if (!addrList.length)
         return JSON.stringify({ error: "No traders passed the filter." }, null, 2);
-      }
     }
 
-    // sanity check
     const bad = addrList.filter(a => !ETH_RE.test(a));
     if (bad.length) return `❌ Invalid address(es): ${bad.join(", ")}`;
 
-    const now       = Date.now();
+    const now = Date.now();
     const startTime = now - hours * MS_HOUR;
 
-    // pull fills
     const fills = await Promise.all(
       addrList.map(addr =>
         limit(async () => {
           try {
-            const { data } = await axios.post(
-              `${this.restBase}/info`,
-              { type: "userFillsByTime",
-                user: addr, startTime, endTime: now, aggregateByTime: false },
-              { headers: { "Content-Type": "application/json" } }
-            );
-            return { address: addr, fills: data || [] };
+            const { data } = await hlPost({
+              type: "userFillsByTime",
+              user: addr,
+              startTime,
+              endTime: now,
+              aggregateByTime: false
+            });
+            return { address: addr, fills: (data || []).slice(-MAX_FILLS), truncated: (data || []).length > MAX_FILLS };
           } catch (e) {
             const msg = e.response ? JSON.stringify(e.response.data) : e.message;
             return { address: addr, error: msg };
@@ -346,17 +443,15 @@ Returns either:
       )
     );
 
-    // analyse & optional open positions
     const summary = await Promise.all(
       fills.map(async r => {
         if (r.error) return { address: r.address, error: r.error };
-
         const o = {
-          address:  r.address,
-          fills:    r.fills,
+          address: r.address,
+          fills: r.fills,
+          truncated: r.truncated,
           insights: analyseFills(r.fills)
         };
-
         if (positions) {
           o.openPositions = await fetchOpenPositions(this.restBase, r.address);
         }
