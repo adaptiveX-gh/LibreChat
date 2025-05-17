@@ -497,6 +497,7 @@ ticker (tickerLookup), params{} (mode-specific knobs).`;
     minWinrate: z.number().optional().default(0),
     minDuration: z.number().optional().default(0),
     hours: z.number().int().min(1).max(168).default(1).optional(),
+    minutes: z.number().int().min(1).max(59).optional(),
     positions: z.boolean().optional().default(false),
 
     ticker: z.string().optional() // legacy convenience
@@ -550,7 +551,16 @@ ticker (tickerLookup), params{} (mode-specific knobs).`;
     if (bad.length) return `❌ Invalid address(es): ${bad.join(", ")}`;
 
     const now = Date.now();
-    const startTime = now - hours * MS_HOUR;
+
+    let lookbackMs;
+    if (typeof args.minutes === "number") {
+      // minutes field overrides hours when present
+      lookbackMs = args.minutes * 60_000;
+    } else {
+      lookbackMs = hours * 3_600_000;          // default behaviour
+    }
+    const startTime = now - lookbackMs;
+
 
     const fills = await Promise.all(
       addrList.map(addr =>
