@@ -14,7 +14,7 @@
  *   • mode:"microFlowPulse"        → every coin touched in last N min (no size filter)
  *   • mode:"divergenceRadar"       → whales closing ≥ $X while others open ≥ $Y same side
  *   • mode:"compressionRadar"      → tight range ≤ bp + whale build ≥ $X
- *   • trendBias                    – 15-min same-side accumulation
+ *   • mode:"trendBias" → ranked net build over last N minutes (default 15 m) params: { windowMs, minNotional, topN }
  *   • mode:"liquidationSweep"      → list all liquidations in the last N seconds
  * ─────────────────────────────────────────────────────────────
  */
@@ -425,8 +425,80 @@ async function runTopMover({ addrList, windowMs = 300_000 }) {
   };
 }
 
-// stubs for other strategies (return 'no-setup' for now)
-const runTrendBias = async () => ({ result: "no-trend" });
+/**
+ * runTrendBias – same-side accumulation table
+ * params:
+ *   windowMs       default 900_000  (15 min)
+ *   minNotional    default 75_000   (abs(net) ≥ this to list)
+ *   topN           default 6        (# of rows to return)
+ */
+async function runTrendBias({ addrList }, p = {}) {
+  const {
+    windowMs    = 900_000,
+    minNotional = 75_000,
+    topN        = 6
+  } = p;
+
+  const end   = Date.now();
+  const start = end - windowMs;
+
+  // 1️⃣ pull fills for every wallet
+  const fillsResp = await Promise.all(
+    addrList.map(addr =>
+      limit(async () => {
+        try {
+          const { data } = await hlPost({
+            type: "userFillsByTime",
+            user: addr,
+            startTime: start,
+            endTime:   end,
+            aggregateByTime: false
+          });
+          return { addr, fills: data || [] };
+        } catch { return { addr, fills: [] }; }
+      })
+    )
+  );
+
+  // 2️⃣ aggregate net build by coin
+  const agg = {}; // coin → { net, wallets:Set, details:{} }
+  for (const r of fillsResp) {
+    let perCoin = {};
+    for (const f of r.fills) {
+      const n = Math.abs(+f.sz) * +f.px;
+      const sign = f.dir.includes("Long")
+                    ? (f.dir.startsWith("Close") ? -1 : +1)
+                    : (f.dir.startsWith("Close") ? +1 : -1);
+      perCoin[f.coin] = (perCoin[f.coin] || 0) + n * sign;
+    }
+    for (const [coin, delta] of Object.entries(perCoin)) {
+      if (!agg[coin]) agg[coin] = { net: 0, wallets:new Set(), details:{} };
+      agg[coin].net += delta;
+      agg[coin].wallets.add(r.addr);
+      agg[coin].details[r.addr] = delta;
+    }
+  }
+
+  // 3️⃣ build sorted list
+  const ranked = Object.entries(agg)
+    .filter(([,v]) => Math.abs(v.net) >= minNotional)
+    .map(([coin,v]) => ({
+      coin:         `${coin}-PERP`,
+      side:         v.net > 0 ? "long" : "short",
+      netNotional:  big$(Math.abs(v.net)),
+      walletCount:  v.wallets.size,
+      topWallets:   Object.entries(v.details)
+                     .sort((a,b)=>Math.abs(b[1])-Math.abs(a[1]))
+                     .slice(0,3)
+                     .map(([addr,delta])=>({ addr, delta:big$(delta) }))
+    }))
+    .sort((a,b)=>Math.abs(+b.netNotional.replace(/,/g,'')) -
+                 Math.abs(+a.netNotional.replace(/,/g,'')))
+    .slice(0, topN);
+
+  return ranked.length ? ranked : { result: "no-trend" };
+}
+
 
 async function runLiquidationSniper({ addrList }, p = {}) {
   // ---------- configurable knobs ----------
@@ -805,7 +877,7 @@ const strategies = {
   divergenceRadar: async (a,p)=>runDivergence(a,p),
   liquidationSniper: async (a, p) => runLiquidationSniper(a, p),
   compressionRadar: async (a,p)=>runCompressionRadar(a,p),
-  trendBias: runTrendBias
+  trendBias: async (a,p)=>runTrendBias(a,p)
 };
 
 // ─────────────────────────────────────────────────────────────
