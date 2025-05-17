@@ -11,6 +11,7 @@
  *   • compressionRadar            – tight range + heavy build
  *   • topMoverPulse               – biggest 5-min net change
  *   • trendBias                   – 15-min same-side accumulation
+ *   • mode:"liquidationSweep"         → list all liquidations in the last N seconds
  * ─────────────────────────────────────────────────────────────
  */
 
@@ -117,10 +118,13 @@ const getSpotMeta = cached(async () => {
   return data.universe ?? [];
 });
 
-async function fetchLiquidations(start, end) {
-  const { data } = await hlPost({ type: "liquidations", startTime: start, endTime: end });
-  return data.events ?? [];
-}
+async function fetchLiquidations(startMs, endMs) {
+   // Hyperliquid wants seconds (ints) and ≤120-sec span
+   const start = Math.floor(startMs / 1000);
+   const end   = Math.floor(endMs   / 1000);
+   const { data } = await hlPost({ type: "liquidations", startTime: start, endTime: end });
+   return data.events ?? [];
+ }
 
 /**
  * Sum liquidations by coin & side in a time-window
@@ -302,6 +306,21 @@ async function runTopMover({ addrList, windowMs = 300_000 }) {
     )
   );
 
+  async function runLiquidationSweep({ windowMs = 60_000 } = {}) {
+    const end   = Date.now();
+    const start = end - Math.min(windowMs, 119_000);
+    const liqAgg = await aggregateLiquidations(start, end);
+
+    return Object.entries(liqAgg).map(([coin, s]) => ({
+      coin: `${coin}-PERP`,
+      longLiq: big$(s.longs || 0),
+      shortLiq: big$(s.shorts || 0)
+    })).sort((a, b) =>
+        (Math.max(+b.longLiq.replace(/,/g,''), +b.shortLiq.replace(/,/g,'')) -
+        Math.max(+a.longLiq.replace(/,/g,''), +a.shortLiq.replace(/,/g,''))));
+  }
+
+
   const coinNet = {}; // coin → { side, notional, wallets: Set }
   for (const r of fillsResp) {
     for (const f of r.fills) {
@@ -348,7 +367,7 @@ async function runLiquidationSniper({ addrList }, p = {}) {
   } = p;
 
   const end = Date.now();
-  const startLiq  = end - lookbackLiqMs;
+  const startLiq  = end - Math.min(lookbackLiqMs, 119_000); // API hard-limit
   const startFill = end - lookbackBuildMs;
 
   // ---- 1. fetch liquidations in the window ----
@@ -428,6 +447,7 @@ async function runLiquidationSniper({ addrList }, p = {}) {
 const strategies = {
   tickerLookup: async (_args, params) => runTickerLookup(params),
   topMoverPulse: async (args, params) => runTopMover({ ...params, ...args }),
+  liquidationSweep: async (_a, p) => runLiquidationSweep(p),
   divergenceRadar: runDivergence,
   liquidationSniper: async (a, p) => runLiquidationSniper(a, p),
   compressionRadar: runCompressionRadar,
