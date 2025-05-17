@@ -10,11 +10,12 @@
  *   • liquidationSniper           – whales fade liquidations
  *   • compressionRadar            – tight range + heavy build
  *   • topMoverPulse               – biggest 5-min net change
- *   • mode:"flowSweep"                → net whale flow for all coins (last N min)
- *   • mode:"microFlowPulse"           → every coin touched in last N min (no size filter)
- *   • mode:"divergenceRadar" → whales closing ≥ $X while others open ≥ $Y same side
- *   • trendBias                   – 15-min same-side accumulation
- *   • mode:"liquidationSweep"         → list all liquidations in the last N seconds
+ *   • mode:"flowSweep"             → net whale flow for all coins (last N min)
+ *   • mode:"microFlowPulse"        → every coin touched in last N min (no size filter)
+ *   • mode:"divergenceRadar"       → whales closing ≥ $X while others open ≥ $Y same side
+ *   • mode:"compressionRadar"      → tight range ≤ bp + whale build ≥ $X
+ *   • trendBias                    – 15-min same-side accumulation
+ *   • mode:"liquidationSweep"      → list all liquidations in the last N seconds
  * ─────────────────────────────────────────────────────────────
  */
 
@@ -685,6 +686,116 @@ async function runDivergence({ addrList }, p = {}) {
   return { result: "no-divergence" };
 }
 
+/**
+ * runCompressionRadar – tight range + whale build
+ * params:
+ *   windowMs      default 480_000  (8 min)
+ *   rangeBp       default 30       (0.30 % range)
+ *   netBuildUsd   default 75_000   (abs(net) ≥ this)
+ *   minWallets    default 3
+ *   minTicks      default 50  – minimum candle count to accept
+ */
+async function runCompressionRadar({ addrList }, p = {}) {
+  const {
+    windowMs    = 480_000,
+    rangeBp     = 30,
+    netBuildUsd = 75_000,
+    minWallets  = 3,
+    minTicks    = 50
+  } = p;
+
+  const end   = Date.now();
+  const start = end - windowMs;
+
+  // 1️⃣ pull 1-second candles (HL supports "1s" since 2025-02)
+  const { data: candles } = await hlPost({
+    type: "candles",
+    coin: "all",                 // special arg: every perp
+    resolution: "1s",
+    startTime: Math.floor(start/1000),
+    endTime:   Math.floor(end  /1000)
+  });
+
+  // reshape: coin → [{h,l}]
+  const coinStats = {};
+  for (const c of candles) {
+    if (!coinStats[c.coin]) coinStats[c.coin] = { hi: -1e9, lo: 1e9, ticks: 0 };
+    const s = coinStats[c.coin];
+    s.hi = Math.max(s.hi, +c.high);
+    s.lo = Math.min(s.lo, +c.low);
+    s.ticks++;
+  }
+
+  // 2️⃣ pull wallet fills in the same window
+  const fillsResp = await Promise.all(
+    addrList.map(addr =>
+      limit(async () => {
+        try {
+          const { data } = await hlPost({
+            type: "userFillsByTime",
+            user: addr,
+            startTime: start,
+            endTime:   end,
+            aggregateByTime: false
+          });
+          return { addr, fills: data || [] };
+        } catch { return { addr, fills: [] }; }
+      })
+    )
+  );
+
+  // 3️⃣ aggregate net build per coin
+  const flow = {}; // coin → { net, wallets: Set, details:{} }
+  for (const r of fillsResp) {
+    let perCoin = {};
+    for (const f of r.fills) {
+      const n = Math.abs(+f.sz) * +f.px;
+      const sign = f.dir.includes("Long")
+                    ? (f.dir.startsWith("Close") ? -1 : +1)
+                    : (f.dir.startsWith("Close") ? +1 : -1);
+      perCoin[f.coin] = (perCoin[f.coin] || 0) + n * sign;
+    }
+    for (const [coin, delta] of Object.entries(perCoin)) {
+      if (!flow[coin]) flow[coin] = { net: 0, wallets:new Set(), details:{} };
+      flow[coin].net += delta;
+      flow[coin].wallets.add(r.addr);
+      flow[coin].details[r.addr] = delta;
+    }
+  }
+
+  // 4️⃣ evaluate coins for compression + build
+  for (const [coin, stat] of Object.entries(coinStats)) {
+    if (stat.ticks < minTicks) continue;              // too few trades
+    const rangePct = 10000 * (stat.hi - stat.lo) / stat.lo; // bps
+
+    if (rangePct > rangeBp) continue;                 // not tight enough
+    const f = flow[coin];
+    if (!f) continue;
+
+    if (Math.abs(f.net) < netBuildUsd) continue;
+    if (f.wallets.size  < minWallets) continue;
+
+    const side = f.net > 0 ? "long" : "short";
+    const topBuilders = Object.entries(f.details)
+      .sort((a,b)=>Math.abs(b[1])-Math.abs(a[1]))
+      .slice(0,5)
+      .map(([addr,delta])=>({ addr, delta: big$(delta) }));
+
+    return {
+      coin: `${coin}-PERP`,
+      windowMinutes: (windowMs/60000).toFixed(1),
+      rangeBps: rangePct.toFixed(1),
+      netBuild: big$(Math.abs(f.net)),
+      side,
+      walletCount: f.wallets.size,
+      topBuilders
+    };
+  }
+
+  return { result: "no-compression" };
+}
+
+
 
 // strategy registry
 const strategies = {
@@ -695,7 +806,7 @@ const strategies = {
   liquidationSweep: async (_a, p) => runLiquidationSweep(p),
   divergenceRadar: async (a,p)=>runDivergence(a,p),
   liquidationSniper: async (a, p) => runLiquidationSniper(a, p),
-  compressionRadar: runCompressionRadar,
+  compressionRadar: async (a,p)=>runCompressionRadar(a,p),
   trendBias: runTrendBias
 };
 
