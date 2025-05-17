@@ -10,6 +10,8 @@
  *   • liquidationSniper           – whales fade liquidations
  *   • compressionRadar            – tight range + heavy build
  *   • topMoverPulse               – biggest 5-min net change
+ *   • mode:"flowSweep"                → net whale flow for all coins (last N min)
+ *   • mode:"microFlowPulse"           → every coin touched in last N min (no size filter)
  *   • trendBias                   – 15-min same-side accumulation
  *   • mode:"liquidationSweep"         → list all liquidations in the last N seconds
  * ─────────────────────────────────────────────────────────────
@@ -311,6 +313,71 @@ async function runTopMover({ addrList, windowMs = 300_000 }) {
     )
   );
 
+  /**
+   * runFlowSweep  – net whale flow for all coins in the look-back window
+   * params:
+   *   windowMs       (default 300 000  = 5 min)
+   *   minNotional    (default 50 000   = $ threshold to list a coin)
+   * returns: [{ coin, net, side, walletCount, topWallets[] }]
+   */
+  async function runFlowSweep({ addrList }, p = {}) {
+    const {
+      windowMs    = 300_000,
+      minNotional = 50_000
+    } = p;
+
+    const end   = Date.now();
+    const start = end - windowMs;
+
+    // 1. pull fills
+    const fillsResp = await Promise.all(
+      addrList.map(addr =>
+        limit(async () => {
+          try {
+            const { data } = await hlPost({
+              type: "userFillsByTime",
+              user: addr,
+              startTime: start,
+              endTime:   end,
+              aggregateByTime: false
+            });
+            return { addr, fills: data || [] };
+          } catch { return { addr, fills: [] }; }
+        })
+      )
+    );
+
+    // 2. aggregate by coin
+    const agg = {};   // coin -> { net, wallets: {} }
+    for (const r of fillsResp) {
+      for (const f of r.fills) {
+        const n    = Math.abs(+f.sz) * +f.px;
+        const sign = f.dir.includes("Long")
+                      ? (f.dir.startsWith("Close") ? -1 : +1)
+                      : (f.dir.startsWith("Close") ? +1 : -1);
+        if (!agg[f.coin]) agg[f.coin] = { net: 0, wallets: {} };
+        agg[f.coin].net += n * sign;
+        agg[f.coin].wallets[r.addr] = (agg[f.coin].wallets[r.addr] || 0) + n * sign;
+      }
+    }
+
+    // 3. build result list
+    return Object.entries(agg)
+      .filter(([, v]) => Math.abs(v.net) >= minNotional)
+      .map(([coin, v]) => ({
+        coin:        `${coin}-PERP`,
+        netNotional: big$(Math.abs(v.net)),
+        side:        v.net > 0 ? "net long" : "net short",
+        walletCount: Object.keys(v.wallets).length,
+        topWallets:  Object.entries(v.wallets)
+                      .sort((a,b)=>Math.abs(b[1])-Math.abs(a[1]))
+                      .slice(0,3)
+                      .map(([addr, flow]) => ({ addr, flow: big$(flow) }))
+      }))
+      .sort((a,b)=>Math.abs(b.net) - Math.abs(a.net));
+  }
+
+
   async function runLiquidationSweep({ windowMs = 60_000 } = {}) {
     const end   = Date.now();
     const start = end - Math.min(windowMs, 119_000);
@@ -447,11 +514,93 @@ async function runLiquidationSniper({ addrList }, p = {}) {
   return { result: "no-setup" };
 }
 
+/**
+ * runMicroFlowPulse – lightest-weight activity scan
+ * params:
+ *   windowMs (default  300_000 = 5 min)
+ *   maxCoins (default  15)   // return top-N coins by |netNotional|
+ */
+async function runMicroFlowPulse({ addrList }, p = {}) {
+  const { windowMs = 300_000, maxCoins = 15 } = p;
+  const end   = Date.now();
+  const start = end - windowMs;
+
+  // 1️⃣ pull fills for every wallet
+  const fillsResp = await Promise.all(
+    addrList.map(addr =>
+      limit(async () => {
+        try {
+          const { data } = await hlPost({
+            type: "userFillsByTime",
+            user: addr,
+            startTime: start,
+            endTime:   end,
+            aggregateByTime: false
+          });
+          return { addr, fills: data || [] };
+        } catch { return { addr, fills: [] }; }
+      })
+    )
+  );
+
+  // 2️⃣ aggregate by coin
+  const agg = {};   // coin → stats
+  for (const r of fillsResp) {
+    for (const f of r.fills) {
+      const coin = f.coin;
+      const n    = Math.abs(+f.sz) * +f.px;
+      const longSide  = f.dir.includes("Long");
+      const isOpen    = f.dir.startsWith("Open");
+
+      if (!isOpen) continue;                 // count opens only (directional intent)
+
+      if (!agg[coin]) {
+        agg[coin] = {
+          notionalLong: 0, notionalShort: 0,
+          countLong: 0,    countShort: 0,
+          wallets: new Set(),
+          latestFillTs: 0
+        };
+      }
+      const c = agg[coin];
+
+      if (longSide) {
+        c.notionalLong += n;
+        c.countLong    += 1;
+      } else {
+        c.notionalShort += n;
+        c.countShort    += 1;
+      }
+      c.wallets.add(r.addr);
+      c.latestFillTs = Math.max(c.latestFillTs, f.time);
+    }
+  }
+
+  // 3️⃣ build output
+  return Object.entries(agg)
+    .map(([coin, s]) => ({
+      coin: `${coin}-PERP`,
+      notionalLong:  big$(s.notionalLong),
+      notionalShort: big$(s.notionalShort),
+      netNotional:   big$(s.notionalLong - s.notionalShort),
+      countLong:     s.countLong,
+      countShort:    s.countShort,
+      walletsActive: s.wallets.size,
+      latestFillTs:  s.latestFillTs
+    }))
+    .sort((a,b) => Math.abs(+b.netNotional.replace(/,/g,'')) -
+                   Math.abs(+a.netNotional.replace(/,/g,'')))
+    .slice(0, maxCoins);
+}
+
+
 
 // strategy registry
 const strategies = {
   tickerLookup: async (_args, params) => runTickerLookup(params),
   topMoverPulse: async (args, params) => runTopMover({ ...params, ...args }),
+  microFlowPulse:   async (a,p)=>runMicroFlowPulse(a,p),
+  flowSweep:        async (a, p) => runFlowSweep(a, p),  
   liquidationSweep: async (_a, p) => runLiquidationSweep(p),
   divergenceRadar: runDivergence,
   liquidationSniper: async (a, p) => runLiquidationSniper(a, p),
