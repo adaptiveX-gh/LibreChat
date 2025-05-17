@@ -1,23 +1,14 @@
 /**
  * hyperliquid.js  —  LangChain Tool
  *
- * Sources trader wallets from:
- *   • explicit "addresses": [...]                         (direct mode)
- *   • Browse AI robot table  →  useBrowse: true           (browse-mode)
- *   • Google Sheet CSV       →  useSheet:  true           (sheet-mode)
- *
- * Optional filters (browse / sheet):
- *   • minWinrate   – percent (default 0)
- *   • minDuration  – hours   (default 0)
- *
- * Other options:
- *   • hours        – look-back window for fills   (1-168, default 1)
- *   • positions    – boolean. include live open positions
- *
- * Returns JSON [{ address, fills, insights, openPositions? }]
+ * v2  ·  2025-05-16
+ * ─────────────────────────────────────────────────────────────
+ * ➊ Whale-analysis of trader wallets
+ * ➋ Ticker-lookup (“Is SOL tradable, spot or perp?”)
+ * ─────────────────────────────────────────────────────────────
  */
 
-const axios    = require("axios");
+const axios  = require("axios");
 const { Tool } = require("@langchain/core/tools");
 const { z }    = require("zod");
 
@@ -29,20 +20,20 @@ const API_BAI  = "https://api.browse.ai/v2";
 const MS_HOUR  = 3_600_000;
 
 const ETH_RE   = /^0x[0-9a-fA-F]{40}$/;
-const big$     = n =>
-  (+n).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const big$     = n => (+n).toLocaleString("en-US",
+                    { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 
 // Browse AI creds
-const BAI_KEY   = process.env.BROWSEAI_API_KEY;
-const BAI_TEAM  = process.env.BROWSEAI_TEAM_ID;
-const BAI_ROBOT = process.env.BROWSEAI_ROBOT_ID;
+const { BROWSEAI_API_KEY:  BAI_KEY,
+        BROWSEAI_TEAM_ID:  BAI_TEAM,
+        BROWSEAI_ROBOT_ID: BAI_ROBOT } = process.env;
 
 // Google Sheet creds
-const GS_ID     = process.env.GOOGLE_SHEET_ID;
-const GS_GID    = process.env.GOOGLE_SHEET_GID || 0;
+const { GOOGLE_SHEET_ID:  GS_ID,
+        GOOGLE_SHEET_GID: GS_GID = 0 } = process.env;
 
 // thresholds for Hyperliquid insight detection
-const BIG_NOTIONAL = 50_000; // USD
+const BIG_NOTIONAL = 50_000;   // USD
 const DRIP_COUNT   = 15;
 const DRIP_SIZE    = 500;
 
@@ -57,19 +48,15 @@ function limiter(max = 4) {
     const { fn, res, rej } = q.shift();
     active++;
     fn().then(res).catch(rej).finally(() => {
-      active--;
-      next();
+      active--; next();
     });
   }
-  return fn => new Promise((res, rej) => {
-    q.push({ fn, res, rej });
-    next();
-  });
+  return fn => new Promise((res, rej) => { q.push({ fn, res, rej }); next(); });
 }
 const limit = limiter(4);
 
 // ─────────────────────────────────────────────────────────────
-// 2A.  Browse AI helper  (unchanged)
+// 2A.  Browse AI helper (unchanged)
 // ─────────────────────────────────────────────────────────────
 async function fetchBrowseRows() {
   if (!BAI_KEY || !BAI_TEAM || !BAI_ROBOT) {
@@ -79,10 +66,8 @@ async function fetchBrowseRows() {
   // most-recent successful task
   const taskList = await axios.get(
     `${API_BAI}/robots/${BAI_ROBOT}/tasks`,
-    {
-      params: { teamId: BAI_TEAM, status: "successful", limit: 1, page: 1 },
-      headers: { Authorization: `Bearer ${BAI_KEY}` }
-    }
+    { params: { teamId: BAI_TEAM, status: "successful", limit: 1, page: 1 },
+      headers: { Authorization: `Bearer ${BAI_KEY}` } }
   );
   if (!taskList.data.tasks?.length) return [];
 
@@ -94,12 +79,12 @@ async function fetchBrowseRows() {
 
   const rows = task.data.result?.tables?.[0]?.rows || [];
   return rows.map(r => ({
-    addr:   (r["Origin URL"] || "").match(ETH_RE)?.[0] || null,
-    winrate: Number((r["Winrate"] || "").match(/([\d.]+)/)?.[1] || 0),
-    duration: (() => {
-      const [h, m] = (r["Duration"] || "").split(/[hm]/).filter(Boolean);
-      return (+h || 0) + (+m || 0) / 60;
-    })()
+      addr:    (r["Origin URL"] || "").match(ETH_RE)?.[0] || null,
+      winrate: Number((r["Winrate"] || "").match(/([\d.]+)/)?.[1] || 0),
+      duration: (() => {
+        const [h, m] = (r["Duration"] || "").split(/[hm]/).filter(Boolean);
+        return (+h || 0) + (+m || 0) / 60;
+      })()
   })).filter(r => r.addr);
 }
 
@@ -123,8 +108,8 @@ async function fetchSheetRows() {
     const addr = obj.wallet?.toLowerCase() || "";
     if (!ETH_RE.test(addr)) return null;
 
-    const win  = Number((obj.winrate || "").replace("%", ""));
-    const dur  = (() => {
+    const win = Number((obj.winrate || "").replace("%", ""));
+    const dur = (() => {
       const hr = (obj.duration.match(/(\d+)\s*h/i) || [])[1];
       const mn = (obj.duration.match(/(\d+)\s*m/i) || [])[1];
       if (hr || mn) return (+hr || 0) + (+mn || 0) / 60;
@@ -149,7 +134,7 @@ function analyseFills(fills = []) {
     const notional = Math.abs(+f.sz) * +f.px;
     const sideWord = f.dir.includes("Long") ? "long" : "short";
 
-    // profit-takes
+    // profit takes
     if (f.dir.startsWith("Close") && notional >= BIG_NOTIONAL) {
       out.profitTakes.push({
         coin, dir: f.dir, size: big$(f.sz), px: big$(f.px),
@@ -218,22 +203,25 @@ class HyperliquidAPI extends Tool {
   name = "hyperliquid";
 
   description = `
-Analyse Hyperliquid whale activity.
+Analyse Hyperliquid whale activity **or** query whether a ticker is tradable.
 
 Source modes (choose one):
-• "addresses": [...]           – explicit wallet list
-• "useBrowse": true            – pull from Browse AI robot table
-• "useSheet":  true            – pull from Google Sheet CSV
+• "addresses": [...]  – explicit wallet list
+• "useBrowse": true   – pull from Browse AI robot table
+• "useSheet":  true   – pull from Google Sheet CSV
+• "ticker":    "SOL"  – lookup mode (returns perp/spot availability)
 
 Optional filters (browse / sheet):
-• minWinrate   – %  (default 0)
-• minDuration  – h  (default 0)
+• minWinrate – %  (default 0)
+• minDuration – h (default 0)
 
 Other options:
-• hours      – look-back window (default 1)
-• positions  – include open positions
+• hours     – look-back window for fills (default 1)
+• positions – include open positions in the output
 
-Returns JSON [{ address, fills, insights, openPositions? }].`;
+Returns either:
+• Ticker info → { ticker, available, perp, spot, spotPairs[] }
+• Wallet summary → [{ address, fills, insights, openPositions? }]`;
 
   schema = z.object({
     addresses:   z.array(z.string()).optional(),
@@ -242,7 +230,8 @@ Returns JSON [{ address, fills, insights, openPositions? }].`;
     minWinrate:  z.number().optional().default(0),
     minDuration: z.number().optional().default(0),
     hours:       z.number().int().min(1).max(168).default(1).optional(),
-    positions:   z.boolean().optional().default(false)
+    positions:   z.boolean().optional().default(false),
+    ticker:      z.string().optional()
   });
 
   constructor(fields = {}) {
@@ -257,7 +246,8 @@ Returns JSON [{ address, fills, insights, openPositions? }].`;
    *   minWinrate?: number,
    *   minDuration?: number,
    *   hours?: number,
-   *   positions?: boolean
+   *   positions?: boolean,
+   *   ticker?: string
    * }} args */
   async _call(args) {
     const {
@@ -267,20 +257,58 @@ Returns JSON [{ address, fills, insights, openPositions? }].`;
       minWinrate = 0,
       minDuration = 0,
       hours = 1,
-      positions = false
+      positions = false,
+      ticker
     } = args;
 
-    // ---------------- wallet sourcing ----------------
+    // ─────────────── ticker lookup branch ───────────────
+    if (ticker) {
+      const raw     = ticker.toUpperCase().trim();             // user input
+      const clean   = raw.replace(/[-_ ]?(PERP)$/i, "");        // strip -PERP
+      const baseSym = clean.split(/[\/\-_ ]/)[0];              // "SOL" in "SOL/USDC"
+
+      // 1. perp list
+      const { data: perpMeta } = await axios.post(
+        `${this.restBase}/info`,
+        { type: "meta" },
+        { headers: { "Content-Type": "application/json" } }
+      );
+      const perpCoins = (perpMeta.universe ?? []).map(u => u.name.toUpperCase());
+
+      // 2. spot list
+      const { data: spotMeta } = await axios.post(
+        `${this.restBase}/info`,
+        { type: "spotMeta" },
+        { headers: { "Content-Type": "application/json" } }
+      );
+      const spotPairs = (spotMeta.universe ?? []).map(u => u.name.toUpperCase());
+
+      // 3. membership tests
+      const inPerp = perpCoins.includes(baseSym);
+      const inSpot = spotPairs.some(
+        p => p === clean ||
+             p.startsWith(`${baseSym}/`) ||
+             p.endsWith(`/${baseSym}`)
+      );
+      return JSON.stringify({
+        ticker:     raw,
+        available:  inPerp || inSpot,
+        perp:       inPerp,
+        spot:       inSpot,
+        spotPairs:  inSpot ? spotPairs
+                              .filter(p => p.includes(baseSym))
+                              .sort() : []
+      }, null, 2);
+    }
+
+    // ─────────────── whale-analysis branch ───────────────
     let addrList = addresses;
 
     if (useBrowse || useSheet || !addrList.length) {
       let rows = [];
 
-      if (useBrowse) {
-        rows = await fetchBrowseRows();
-      } else if (useSheet) {
-        rows = await fetchSheetRows();
-      }
+      if (useBrowse) rows = await fetchBrowseRows();
+      else if (useSheet) rows = await fetchSheetRows();
 
       addrList = rows
         .filter(r => r.winrate >= minWinrate && r.duration >= minDuration)
@@ -298,20 +326,15 @@ Returns JSON [{ address, fills, insights, openPositions? }].`;
     const now       = Date.now();
     const startTime = now - hours * MS_HOUR;
 
-    // ---------------- pull fills ----------------
+    // pull fills
     const fills = await Promise.all(
       addrList.map(addr =>
         limit(async () => {
           try {
             const { data } = await axios.post(
               `${this.restBase}/info`,
-              {
-                type: "userFillsByTime",
-                user: addr,
-                startTime,
-                endTime: now,
-                aggregateByTime: false
-              },
+              { type: "userFillsByTime",
+                user: addr, startTime, endTime: now, aggregateByTime: false },
               { headers: { "Content-Type": "application/json" } }
             );
             return { address: addr, fills: data || [] };
@@ -323,7 +346,7 @@ Returns JSON [{ address, fills, insights, openPositions? }].`;
       )
     );
 
-    // ---------------- analyse & open positions ----------------
+    // analyse & optional open positions
     const summary = await Promise.all(
       fills.map(async r => {
         if (r.error) return { address: r.address, error: r.error };
