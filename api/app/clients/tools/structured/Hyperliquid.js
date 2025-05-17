@@ -12,6 +12,7 @@
  *   • topMoverPulse               – biggest 5-min net change
  *   • mode:"flowSweep"                → net whale flow for all coins (last N min)
  *   • mode:"microFlowPulse"           → every coin touched in last N min (no size filter)
+ *   • mode:"divergenceRadar" → whales closing ≥ $X while others open ≥ $Y same side
  *   • trendBias                   – 15-min same-side accumulation
  *   • mode:"liquidationSweep"         → list all liquidations in the last N seconds
  * ─────────────────────────────────────────────────────────────
@@ -593,6 +594,96 @@ async function runMicroFlowPulse({ addrList }, p = {}) {
     .slice(0, maxCoins);
 }
 
+/**
+ * runDivergence – profit-take vs new build on the same side
+ * params:
+ *   windowMs        default 300 000 (5 min)
+ *   closeNotional   $ closed per wallet to count  (default 50 000)
+ *   buildNotional   $ opened per wallet to count  (default 50 000)
+ *   minClosers      wallets closing ≥ closeNotional (default 2)
+ *   minBuilders     wallets opening ≥ buildNotional (default 2)
+ */
+async function runDivergence({ addrList }, p = {}) {
+  const {
+    windowMs      = 300_000,
+    closeNotional = 50_000,
+    buildNotional = 50_000,
+    minClosers    = 2,
+    minBuilders   = 2
+  } = p;
+
+  const end   = Date.now();
+  const start = end - windowMs;
+
+  // 1️⃣ pull fills
+  const fillsResp = await Promise.all(
+    addrList.map(addr =>
+      limit(async () => {
+        try {
+          const { data } = await hlPost({
+            type: "userFillsByTime",
+            user: addr,
+            startTime: start,
+            endTime:   end,
+            aggregateByTime: false
+          });
+          return { addr, fills: data || [] };
+        } catch { return { addr, fills: [] }; }
+      })
+    )
+  );
+
+  // 2️⃣ aggregate per coin who closed vs opened
+  const book = {};   // coin → { closers:{}, builders:{} }
+  for (const r of fillsResp) {
+    for (const f of r.fills) {
+      const coin = f.coin;
+      const n    = Math.abs(+f.sz) * +f.px;          // USD
+      const isLong = f.dir.includes("Long");
+      const side   = isLong ? "long" : "short";
+      const bucket = f.dir.startsWith("Close") ? "closers" :
+                     f.dir.startsWith("Open")  ? "builders" : null;
+      if (!bucket) continue;                         // ignore partials etc.
+
+      if (!book[coin]) book[coin] = { closers:{}, builders:{} };
+      book[coin][bucket][r.addr] = (book[coin][bucket][r.addr] || 0) + n;
+      book[coin].side = side;                        // same side for both buckets
+    }
+  }
+
+  // 3️⃣ find first coin meeting thresholds
+  for (const [coin, data] of Object.entries(book)) {
+    const cAddrs = Object.entries(data.closers)
+                    .filter(([,v]) => v >= closeNotional);
+    const bAddrs = Object.entries(data.builders)
+                    .filter(([,v]) => v >= buildNotional)
+                    .filter(([addr]) => !data.closers[addr]); // must be different wallets
+
+    if (cAddrs.length >= minClosers && bAddrs.length >= minBuilders) {
+      const totalClose = cAddrs.reduce((s,[,v])=>s+v,0);
+      const totalBuild = bAddrs.reduce((s,[,v])=>s+v,0);
+
+      return {
+        coin: `${coin}-PERP`,
+        side: data.side,                       // long or short
+        closers:  {
+          walletCount: cAddrs.length,
+          notional:    big$(totalClose),
+          top: cAddrs.sort((a,b)=>b[1]-a[1]).slice(0,3)
+                .map(([addr,v])=>({ addr, closed: big$(v) }))
+        },
+        builders: {
+          walletCount: bAddrs.length,
+          notional:    big$(totalBuild),
+          top: bAddrs.sort((a,b)=>b[1]-a[1]).slice(0,3)
+                .map(([addr,v])=>({ addr, opened: big$(v) }))
+        }
+      };
+    }
+  }
+
+  return { result: "no-divergence" };
+}
 
 
 // strategy registry
@@ -602,7 +693,7 @@ const strategies = {
   microFlowPulse:   async (a,p)=>runMicroFlowPulse(a,p),
   flowSweep:        async (a, p) => runFlowSweep(a, p),  
   liquidationSweep: async (_a, p) => runLiquidationSweep(p),
-  divergenceRadar: runDivergence,
+  divergenceRadar: async (a,p)=>runDivergence(a,p),
   liquidationSniper: async (a, p) => runLiquidationSniper(a, p),
   compressionRadar: runCompressionRadar,
   trendBias: runTrendBias
