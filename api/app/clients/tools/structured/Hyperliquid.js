@@ -122,6 +122,24 @@ async function fetchLiquidations(start, end) {
   return data.events ?? [];
 }
 
+/**
+ * Sum liquidations by coin & side in a time-window
+ * Returns: { "<COIN>": { longs: notionalUSD, shorts: notionalUSD } }
+ */
+async function aggregateLiquidations(start, end) {
+  const events = await fetchLiquidations(start, end);
+  const out = {};
+  for (const ev of events) {
+    // ev.side is "long" when long positions are liquidated (forced sells)
+    const coin = ev.coin;
+    const side = ev.side === "long" ? "longs" : "shorts";
+    const notional = Math.abs(+ev.sz) * +ev.px;
+    if (!out[coin]) out[coin] = { longs: 0, shorts: 0 };
+    out[coin][side] += notional;
+  }
+  return out;
+}
+
 async function fetchOpenInterests() {
   const { data } = await hlPost({ type: "openInterests" });
   return data ?? {};
@@ -316,16 +334,102 @@ async function runTopMover({ addrList, windowMs = 300_000 }) {
 
 // stubs for other strategies (return 'no-setup' for now)
 const runDivergence = async () => ({ result: "no-divergence" });
-const runLiquidationSniper = async () => ({ result: "no-setup" });
 const runCompressionRadar = async () => ({ result: "no-compression" });
 const runTrendBias = async () => ({ result: "no-trend" });
+
+async function runLiquidationSniper({ addrList }, p = {}) {
+  // ---------- configurable knobs ----------
+  const {
+    liqThreshold    = 1_000_000,   // $ total liquidations on one side
+    buildThreshold  = 100_000,     // $ min notional per whale to count
+    minWallets      = 5,           // whales fading the cascade
+    lookbackLiqMs   = 90_000,      // liquidation window
+    lookbackBuildMs = 120_000      // whale build window
+  } = p;
+
+  const end = Date.now();
+  const startLiq  = end - lookbackLiqMs;
+  const startFill = end - lookbackBuildMs;
+
+  // ---- 1. fetch liquidations in the window ----
+  const liqAgg = await aggregateLiquidations(startLiq, end);
+
+  // ---- 2. fetch whale fills in the window ----
+  const fillsResp = await Promise.all(
+    addrList.map(addr =>
+      limit(async () => {
+        try {
+          const { data } = await hlPost({
+            type: "userFillsByTime",
+            user: addr,
+            startTime: startFill,
+            endTime: end,
+            aggregateByTime: false
+          });
+          return { addr, fills: data || [] };
+        } catch {
+          return { addr, fills: [] };
+        }
+      })
+    )
+  );
+
+  // ---- 3. evaluate each coin for the pattern ----
+  for (const [coin, liq] of Object.entries(liqAgg)) {
+    const cascadeSide = liq.longs >= liqThreshold ? "longs" :
+                        liq.shorts >= liqThreshold ? "shorts" : null;
+    if (!cascadeSide) continue;                       // no big cascade
+
+    const wantBuildSide = cascadeSide === "longs" ? "long" : "short";
+
+    // aggregate whale builds
+    let buildNotional = 0;
+    const walletAdds = {};
+
+    for (const r of fillsResp) {
+      let net = 0;
+      for (const f of r.fills.filter(f => f.coin === coin)) {
+        const n = Math.abs(+f.sz) * +f.px;
+        const isOpen = f.dir.startsWith("Open");
+        const isLong = f.dir.includes("Long");
+        const side   = isLong ? "long" : "short";
+        // only count *opens* (or adds) on the fading side
+        if (isOpen && side === wantBuildSide) net += n;
+      }
+      if (net >= buildThreshold) {
+        walletAdds[r.addr] = net;
+        buildNotional += net;
+      }
+    }
+
+    if (Object.keys(walletAdds).length >= minWallets) {
+      // ---- 4. build result object ----
+      const topBuilders = Object.entries(walletAdds)
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 5)
+        .map(([addr, add]) => ({ addr, add: big$(add) }));
+
+      return {
+        coin: `${coin}-PERP`,
+        cascadeSide: cascadeSide === "longs" ? "longsLiquidated" : "shortsLiquidated",
+        liqNotional: big$((cascadeSide === "longs" ? liq.longs : liq.shorts)),
+        whaleBuild:  `${big$(buildNotional)} net ${wantBuildSide}`,
+        walletCount: Object.keys(walletAdds).length,
+        topBuilders
+      };
+    }
+  }
+
+  return { result: "no-setup" };
+}
+
 
 // strategy registry
 const strategies = {
   tickerLookup: async (_args, params) => runTickerLookup(params),
   topMoverPulse: async (args, params) => runTopMover({ ...params, ...args }),
   divergenceRadar: runDivergence,
-  liquidationSniper: runLiquidationSniper,
+  liquidationSniper: async (a, p) => runLiquidationSniper(a, p),
   compressionRadar: runCompressionRadar,
   trendBias: runTrendBias
 };
